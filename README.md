@@ -52,6 +52,16 @@ Disable this listener or change its port under **Settings > Core** (`PWM in enab
 `PWM in port`). The socket binds `0.0.0.0`, so it works whether the SITL targets
 `127.0.0.1` or this machine's LAN address.
 
+### Intelligent RC gating
+
+When **Require PWM link** is enabled (the default), the emulator only transmits RC
+while the SITL's PWM output is actually being received. If no PWM packet arrives for
+~1.5 s, RC sending pauses automatically and the header shows `STANDBY (no PWM)`;
+once packets resume, sending resumes (`SENDING`). This prevents the emulator from
+spraying stale RC at a SITL that isn't listening. Turn it off under
+**Settings > Core** (`Require PWM link`) to always transmit. The gate is ignored if
+`PWM in enabled` is off (there is nothing to gate on).
+
 ## Requirements
 
 - Python 3.9+
@@ -141,7 +151,7 @@ effect on the next frame.
 ### Parameters
 
 - **Core**: `Target IP`, `RC out port` (default 9004), `Send rate (Hz)`,
-  `PWM in port` (default 9001), `PWM in enabled`
+  `PWM in port` (default 9001), `PWM in enabled`, `Require PWM link` (gate RC on PWM)
 - **PWM range**: `PWM min` / `PWM mid` / `PWM max` (mid may be asymmetric)
 - **Stick feel**: `Return speed` (recenter rate), `Key step rate` (keyboard axis
   speed), `Deadband`, `Expo`

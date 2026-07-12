@@ -89,6 +89,9 @@ class Settings:
     pwm_in_enabled: bool = True
     pwm_in_port: int = 9001
 
+    # Only transmit RC while the SITL's PWM output is being received.
+    require_pwm: bool = True
+
     # PWM range
     pwm_min: int = 1000
     pwm_mid: int = 1500
@@ -494,6 +497,7 @@ def build_fields() -> list:
         Field("Send rate (Hz)", "send_hz", "int", 1, 10, 1, 250),
         Field("PWM in port", "pwm_in_port", "int", 1, 10, 1, 65535),
         Field("PWM in enabled", "pwm_in_enabled", "bool"),
+        Field("Require PWM link", "require_pwm", "bool"),
         Field("PWM RANGE", None, "header"),
         Field("PWM min", "pwm_min", "int", 5, 50, 500, 2500),
         Field("PWM mid", "pwm_mid", "int", 5, 50, 500, 2500),
@@ -662,6 +666,7 @@ class App:
         self.running = True
         self.dragging: Optional[str] = None  # "left" | "right" | None
         self._send_accumulator = 0.0
+        self.rc_active = False  # True while actually transmitting RC
 
         pygame.init()
         pygame.display.set_caption("Betaflight SITL Joystick Emulator")
@@ -845,6 +850,16 @@ class App:
     # Sending
     # ------------------------------------------------------------------
     def _maybe_send(self, dt: float) -> None:
+        # "Intelligent" gating: only transmit RC while the SITL's PWM output is
+        # being received. Skip the gate if PWM input is disabled (nothing to
+        # gate on) or the user turned the requirement off.
+        gate = self.settings.require_pwm and self.settings.pwm_in_enabled
+        if gate and not self.pwm_in.snapshot().connected(PWMReceiver.RX_TIMEOUT):
+            self.rc_active = False
+            self._send_accumulator = 0.0  # avoid a burst when the link returns
+            return
+
+        self.rc_active = True
         interval = 1.0 / max(1, self.settings.send_hz)
         self._send_accumulator += dt
         # Send at most a few packets per frame to catch up without flooding.
@@ -898,9 +913,14 @@ class App:
         self._text("BETAFLIGHT SITL", self.font_title, COL_TEXT, (22, 8))
         self._text("JOYSTICK EMULATOR", self.font_h, COL_ACCENT, (24, 34))
 
-        ok = self.sender.last_error is None
-        dot_col = COL_GOOD if ok else COL_BAD
-        status = "READY" if ok else "SEND ERROR"
+        if self.sender.last_error is not None:
+            status, dot_col = "SEND ERROR", COL_BAD
+        elif self.rc_active:
+            status, dot_col = "SENDING", COL_GOOD
+        elif self.settings.require_pwm and self.settings.pwm_in_enabled:
+            status, dot_col = "STANDBY (no PWM)", COL_WARN
+        else:
+            status, dot_col = "IDLE", COL_TEXT_DIM
         segments = [
             (status, dot_col, True),
             (f"{self.settings.ip}:{self.settings.port}", COL_TEXT, False),
