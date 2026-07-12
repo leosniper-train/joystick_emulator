@@ -2,9 +2,10 @@
 
 A virtual RC transmitter for [Betaflight SITL](https://betaflight.com/docs/development/SITL).
 It sends RC channel packets to the SITL over UDP and can be flown with **mouse**
-(drag the on-screen sticks) or **keyboard** (WASD + arrow keys). All parameters
-(target IP, send rate, PWM range, stick feel, channel mapping, ...) are editable
-in an in-app settings panel and persist to `config.json`.
+(drag the on-screen sticks) or **keyboard** (WASD + arrow keys). It also **receives
+the SITL's motor / servo PWM output** on UDP port 9001 and visualizes it live. All
+parameters (target IP, send rate, PWM range, stick feel, channel mapping, PWM-input
+port, ...) are editable in an in-app settings panel and persist to `config.json`.
 
 ![Two virtual gimbals with channel bars](docs/screenshot.png)
 
@@ -32,6 +33,24 @@ the standard **AETR** mapping:
 | CH4     | Yaw (Rudder)    | Left stick X           |
 | CH5     | ARM             | `Enter` toggle         |
 | CH6-CH8 | AUX 1-3 (modes) | `1` / `2` / `3` toggles |
+
+### Motor / PWM output (port 9001)
+
+The SITL sends its raw PWM output (the `servo_packet_raw` struct) to UDP port 9001.
+The emulator binds that port and shows each motor/servo output as a live bar in the
+**Motor / PWM Output** panel, along with a receive status (`RECEIVING` / `WAITING`).
+
+```c
+typedef struct {
+    uint16_t motorCount;             // number of motors in the output
+    float    pwm_output_raw[16];     // raw PWM ~1000-2000 (motors first, then servos)
+} servo_packet_raw;                  // little-endian, 68 bytes (2 padding bytes after motorCount)
+```
+
+Motors are drawn in blue (`M1..Mn`) and any active servo outputs in violet (`S1..`).
+Disable this listener or change its port under **Settings > Core** (`PWM in enabled`,
+`PWM in port`). The socket binds `0.0.0.0`, so it works whether the SITL targets
+`127.0.0.1` or this machine's LAN address.
 
 ## Requirements
 
@@ -121,7 +140,8 @@ effect on the next frame.
 
 ### Parameters
 
-- **Core**: `Target IP`, `Port`, `Send rate (Hz)`
+- **Core**: `Target IP`, `RC out port` (default 9004), `Send rate (Hz)`,
+  `PWM in port` (default 9001), `PWM in enabled`
 - **PWM range**: `PWM min` / `PWM mid` / `PWM max` (mid may be asymmetric)
 - **Stick feel**: `Return speed` (recenter rate), `Key step rate` (keyboard axis
   speed), `Deadband`, `Expo`
@@ -144,6 +164,11 @@ Delete it to return to defaults.
    another host/VM (e.g. WSL), set **Target IP** accordingly.
 3. In the Betaflight Configurator, map CH5/CH6 to Arm / flight-mode switches so
    the ARM and AUX toggles here do something useful.
+4. Arm and raise throttle: the **Motor / PWM Output** panel lights up `RECEIVING`
+   and the motor bars track the SITL's output. If it stays `WAITING`, confirm the
+   SITL was started so that it targets this machine (`betaflight_SITL.elf <ip>`)
+   and that nothing else is bound to port 9001.
 
-The UDP socket is fire-and-forget (non-blocking), so the emulator runs fine
-whether or not the SITL is currently listening.
+The outgoing RC socket is fire-and-forget (non-blocking), and the incoming PWM
+listener is non-blocking too, so the emulator runs fine whether or not the SITL
+is currently running.

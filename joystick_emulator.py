@@ -32,7 +32,7 @@ from pygame import gfxdraw
 CONFIG_FILENAME = "config.json"
 NUM_PACKET_CHANNELS = 16  # Betaflight SITL always reads a fixed 16-channel struct.
 
-WINDOW_W, WINDOW_H = 1060, 720
+WINDOW_W, WINDOW_H = 1060, 836
 FPS_RENDER_CAP = 120  # Rendering may run faster than the RC send rate.
 
 # ---- Palette (modern dark "avionics" theme) ----
@@ -84,6 +84,10 @@ class Settings:
     port: int = 9004
     send_hz: int = 50
 
+    # PWM output (motor/servo) input from SITL, port 9001
+    pwm_in_enabled: bool = True
+    pwm_in_port: int = 9001
+
     # PWM range
     pwm_min: int = 1000
     pwm_mid: int = 1500
@@ -109,6 +113,7 @@ class Settings:
     def clamp_all(self) -> None:
         """Validate/clamp values into sane ranges."""
         self.port = int(_clamp(self.port, 1, 65535))
+        self.pwm_in_port = int(_clamp(self.pwm_in_port, 1, 65535))
         self.send_hz = int(_clamp(self.send_hz, 1, 250))
         self.pwm_min = int(_clamp(self.pwm_min, 500, 2500))
         self.pwm_max = int(_clamp(self.pwm_max, 500, 2500))
@@ -288,6 +293,108 @@ class RCSender:
 
 
 # ---------------------------------------------------------------------------
+# PWM output receiver (Betaflight SITL -> port 9001)
+# ---------------------------------------------------------------------------
+
+
+class PWMReceiver:
+    """Listens for the SITL's raw PWM output (servo_packet_raw) on a UDP port.
+
+    Packet layout (little-endian, natural C alignment):
+        uint16_t motorCount;
+        <2 bytes padding>
+        float    pwm_output_raw[16];   # motors first, then servos
+    => 68 bytes. Some builds may emit a packed 66-byte variant.
+    """
+
+    RX_TIMEOUT = 1.5  # seconds without a packet => considered "waiting"
+    _S_PADDED = struct.Struct("<H2x16f")   # 68 bytes (default C alignment)
+    _S_PACKED = struct.Struct("<H16f")     # 66 bytes (packed builds)
+
+    def __init__(self, port: int, enabled: bool = True, bind_ip: str = "0.0.0.0") -> None:
+        self.port = port
+        self.enabled = enabled
+        self.bind_ip = bind_ip
+        self.sock: Optional[socket.socket] = None
+        self.error: Optional[str] = None
+
+        self.motor_count = 0
+        self.values = [0.0] * 16
+        self.last_rx = 0.0
+        self.packets = 0
+
+        if enabled:
+            self._open()
+
+    def _open(self) -> None:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.setblocking(False)
+            s.bind((self.bind_ip, self.port))
+            self.sock = s
+            self.error = None
+        except OSError as exc:
+            self.sock = None
+            self.error = str(exc)
+
+    def _close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def reconfigure(self, port: int, enabled: bool) -> None:
+        if port == self.port and enabled == self.enabled:
+            return
+        self.port = port
+        self.enabled = enabled
+        self._close()
+        if enabled:
+            self._open()
+
+    def poll(self) -> None:
+        """Drain the socket and keep the most recent packet."""
+        if self.sock is None:
+            return
+        latest = None
+        for _ in range(128):
+            try:
+                data, _addr = self.sock.recvfrom(2048)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError as exc:
+                self.error = str(exc)
+                break
+            latest = data
+        if latest is None:
+            return
+        parsed = self._parse(latest)
+        if parsed is not None:
+            self.motor_count, self.values = parsed
+            self.last_rx = time.time()
+            self.packets += 1
+
+    def _parse(self, data: bytes):
+        if len(data) >= self._S_PADDED.size:
+            vals = self._S_PADDED.unpack_from(data, 0)
+        elif len(data) >= self._S_PACKED.size:
+            vals = self._S_PACKED.unpack_from(data, 0)
+        else:
+            return None
+        motor_count = min(int(vals[0]), 16)
+        return motor_count, list(vals[1:17])
+
+    def connected(self) -> bool:
+        return self.sock is not None and (time.time() - self.last_rx) < self.RX_TIMEOUT
+
+    def close(self) -> None:
+        self._close()
+
+
+# ---------------------------------------------------------------------------
 # Settings panel
 # ---------------------------------------------------------------------------
 
@@ -324,8 +431,10 @@ def build_fields() -> list:
     return [
         Field("CORE", None, "header"),
         Field("Target IP", "ip", "str"),
-        Field("Port", "port", "int", 1, 10, 1, 65535),
+        Field("RC out port", "port", "int", 1, 10, 1, 65535),
         Field("Send rate (Hz)", "send_hz", "int", 1, 10, 1, 250),
+        Field("PWM in port", "pwm_in_port", "int", 1, 10, 1, 65535),
+        Field("PWM in enabled", "pwm_in_enabled", "bool"),
         Field("PWM RANGE", None, "header"),
         Field("PWM min", "pwm_min", "int", 5, 50, 500, 2500),
         Field("PWM mid", "pwm_mid", "int", 5, 50, 500, 2500),
@@ -485,6 +594,7 @@ class App:
         self.state = RCState()
         self.state.reset(settings)
         self.sender = RCSender(settings.ip, settings.port)
+        self.pwm_in = PWMReceiver(settings.pwm_in_port, settings.pwm_in_enabled)
 
         self.panel = SettingsPanel(settings, config_path)
         self.panel.on_change = self._on_settings_changed
@@ -525,6 +635,7 @@ class App:
             card_h,
         )
         self.chan_card = pygame.Rect(margin, top + card_h + 16, WINDOW_W - 2 * margin, 262)
+        self.motor_card = pygame.Rect(margin, self.chan_card.bottom + 16, WINDOW_W - 2 * margin, 132)
 
         self.gimbal_r = 108
         gy = self.left_card.y + 128
@@ -534,6 +645,7 @@ class App:
     # ------------------------------------------------------------------
     def _on_settings_changed(self) -> None:
         self.sender.retarget(self.settings.ip, self.settings.port)
+        self.pwm_in.reconfigure(self.settings.pwm_in_port, self.settings.pwm_in_enabled)
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -543,11 +655,13 @@ class App:
             if not self.panel_open:
                 self._update_inputs(dt)
             self._maybe_send(dt)
+            self.pwm_in.poll()
             self._render()
         self._shutdown()
 
     def _shutdown(self) -> None:
         self.sender.close()
+        self.pwm_in.close()
         pygame.quit()
 
     # ------------------------------------------------------------------
@@ -692,6 +806,7 @@ class App:
         self._draw_gimbal_card(self.right_card, self.right_center, "right")
         self._draw_status_card(self.center_card)
         self._draw_channels(self.chan_card)
+        self._draw_motors_card(self.motor_card)
         self._draw_legend()
         if self.panel_open:
             self._draw_panel()
@@ -905,6 +1020,57 @@ class App:
             vcol = draw_col if kind in ("arm", "aux") else COL_TEXT
             self._text(str(val), self.font_mono_sm, vcol, (colx + col_w - 12, cy + 12), align="right")
 
+    def _draw_motors_card(self, card: pygame.Rect) -> None:
+        self._panel(card, "Motor / PWM Output")
+        rx = self.pwm_in
+
+        if not rx.enabled:
+            status, scol = "DISABLED", COL_TEXT_FAINT
+        elif rx.error:
+            status, scol = "BIND ERROR", COL_BAD
+        elif rx.connected():
+            status, scol = "RECEIVING", COL_GOOD
+        else:
+            status, scol = "WAITING", COL_WARN
+        header = f"IN :{self.settings.pwm_in_port}   {status}"
+        hx = self._text(header, self.font_h, scol, (card.right - 18, card.y + 13), align="right").x
+        _fill_circle(self.screen, hx - 10, card.y + 19, 4, scol)
+
+        mc = rx.motor_count if rx.motor_count > 0 else 4
+        total = mc
+        for i in range(mc, 16):
+            if rx.values[i] > 0:
+                total = i + 1
+        total = max(1, min(total, 16))
+
+        area_top = card.y + 46
+        area_bottom = card.bottom - 34
+        bar_h = area_bottom - area_top
+        slot = (card.w - 40) / total
+        bar_w = int(min(52, slot - 16))
+        base_x = card.x + 20
+
+        for i in range(total):
+            cx = base_x + slot * i + slot / 2
+            is_motor = i < mc
+            v = rx.values[i]
+            frac = _clamp((v - 1000) / 1000.0, 0.0, 1.0)
+            bx = int(cx - bar_w / 2)
+            pygame.draw.rect(self.screen, COL_TRACK, (bx, area_top, bar_w, bar_h), border_radius=4)
+            fh = int(bar_h * frac)
+            if fh > 0:
+                fill_col = COL_ACCENT if is_motor else COL_AUX
+                pygame.draw.rect(self.screen, fill_col, (bx, area_top + bar_h - fh, bar_w, fh), border_radius=4)
+            # mid reference tick
+            midy = area_top + bar_h // 2
+            pygame.draw.line(self.screen, COL_BORDER_HI, (bx, midy), (bx + bar_w, midy), 1)
+
+            label = f"M{i + 1}" if is_motor else f"S{i - mc + 1}"
+            self._text(label, self.font_small, COL_TEXT_DIM, (cx, card.bottom - 30), align="center")
+            vtxt = str(int(round(v))) if v > 0 else "----"
+            vcol = COL_TEXT if v > 0 else COL_TEXT_FAINT
+            self._text(vtxt, self.font_mono_sm, vcol, (cx, card.bottom - 16), align="center")
+
     def _draw_legend(self) -> None:
         items = [
             ("W/S", "throttle"), ("A/D", "yaw"), ("Arrows", "pitch/roll"),
@@ -930,7 +1096,7 @@ class App:
         overlay.fill((0, 0, 0, 190))
         self.screen.blit(overlay, (0, 0))
 
-        pw, ph = 580, 588
+        pw, ph = 580, 632
         px = (WINDOW_W - pw) // 2
         py = (WINDOW_H - ph) // 2
         pygame.draw.rect(self.screen, COL_PANEL, (px, py, pw, ph), border_radius=12)
