@@ -163,8 +163,11 @@ effect on the next frame.
 ## Configuration file
 
 Settings are stored in `config.json` next to the script (created on first run).
-It is per-machine and git-ignored, so each environment keeps its own values.
-Delete it to return to defaults.
+Every setting is written to the file, and on each launch the file is rewritten to
+include any newly added options (older configs are migrated automatically while
+preserving your existing values). Press `Ctrl`+`S` in the settings panel to save
+changes back to it. It is per-machine and git-ignored, so each environment keeps
+its own values. Delete it to return to defaults.
 
 ## Using with Betaflight SITL
 

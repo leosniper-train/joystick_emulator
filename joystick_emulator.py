@@ -33,7 +33,7 @@ from pygame import gfxdraw
 CONFIG_FILENAME = "config.json"
 NUM_PACKET_CHANNELS = 16  # Betaflight SITL always reads a fixed 16-channel struct.
 
-WINDOW_W, WINDOW_H = 1060, 836
+WINDOW_W, WINDOW_H = 880, 648
 FPS_RENDER_CAP = 120  # Rendering may run faster than the RC send rate.
 
 # ---- Palette (modern dark "avionics" theme) ----
@@ -153,8 +153,9 @@ class Settings:
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 print(f"[settings] could not read {path}: {exc}; using defaults")
         s.clamp_all()
-        if not os.path.isfile(path):
-            s.save(path)
+        # Always (re)write the file so it contains every current setting,
+        # migrating older configs that predate newly added fields.
+        s.save(path)
         return s
 
     def save(self, path: str) -> bool:
@@ -607,14 +608,20 @@ class SettingsPanel:
         if event.type != pygame.KEYDOWN:
             return
 
-        if event.key in (pygame.K_UP, pygame.K_w):
+        ctrl = bool(mods & pygame.KMOD_CTRL)
+        # Check Ctrl+S first so it isn't swallowed by other bindings.
+        if ctrl and event.key == pygame.K_s:
+            self._save()
+            return
+
+        if event.key == pygame.K_UP:
             self._move(-1)
-        elif event.key in (pygame.K_DOWN, pygame.K_s):
+        elif event.key == pygame.K_DOWN:
             self._move(1)
-        elif event.key in (pygame.K_LEFT, pygame.K_a):
+        elif event.key == pygame.K_LEFT:
             step = field_obj.big_step if coarse else field_obj.step
             self._adjust(field_obj, -step)
-        elif event.key in (pygame.K_RIGHT, pygame.K_d):
+        elif event.key == pygame.K_RIGHT:
             step = field_obj.big_step if coarse else field_obj.step
             self._adjust(field_obj, step)
         elif event.key == pygame.K_RETURN:
@@ -623,14 +630,7 @@ class SettingsPanel:
             else:
                 self.editing = True
                 self.edit_buffer = str(getattr(self.settings, field_obj.attr))
-        elif event.key == pygame.K_s and (mods & pygame.KMOD_CTRL):
-            self._save()
-
-    def handle_command_key(self, key: int) -> None:
-        """Keys handled while the panel is open but not editing (S/D)."""
-        if self.editing:
-            return
-        if key == pygame.K_d:
+        elif event.key == pygame.K_d:
             self._reset_defaults()
 
     def _save(self) -> None:
@@ -674,35 +674,40 @@ class App:
         self.clock = pygame.time.Clock()
 
         # Typography: UI font for labels, mono font for numeric readouts.
-        self.font_title = _sysfont(["Segoe UI Semibold", "Segoe UI", "Arial"], 22, bold=True)
-        self.font_h = _sysfont(["Segoe UI", "Arial"], 12, bold=True)
-        self.font = _sysfont(["Segoe UI", "Arial"], 15)
-        self.font_small = _sysfont(["Segoe UI", "Arial"], 12)
-        self.font_mono = _sysfont(["Consolas", "Courier New"], 15)
-        self.font_mono_sm = _sysfont(["Consolas", "Courier New"], 12)
-        self.font_arm = _sysfont(["Segoe UI Black", "Segoe UI", "Arial"], 26, bold=True)
+        self.font_title = _sysfont(["Segoe UI Semibold", "Segoe UI", "Arial"], 19, bold=True)
+        self.font_h = _sysfont(["Segoe UI", "Arial"], 11, bold=True)
+        self.font = _sysfont(["Segoe UI", "Arial"], 14)
+        self.font_small = _sysfont(["Segoe UI", "Arial"], 11)
+        self.font_mono = _sysfont(["Consolas", "Courier New"], 14)
+        self.font_mono_sm = _sysfont(["Consolas", "Courier New"], 11)
+        self.font_arm = _sysfont(["Segoe UI Black", "Segoe UI", "Arial"], 22, bold=True)
 
         # Cached vertical-gradient background.
         self.bg = _make_gradient(WINDOW_W, WINDOW_H, COL_BG_TOP, COL_BG_BOT)
 
         # ---- Layout geometry ----
-        margin = 22
-        top = 66
-        card_w = 372
-        card_h = 300
+        margin = 14
+        gap = 12
+        top = 60
+        card_w = 300
+        card_h = 224
         self.left_card = pygame.Rect(margin, top, card_w, card_h)
         self.right_card = pygame.Rect(WINDOW_W - margin - card_w, top, card_w, card_h)
         self.center_card = pygame.Rect(
-            self.left_card.right + 16,
+            self.left_card.right + gap,
             top,
-            self.right_card.left - self.left_card.right - 32,
+            self.right_card.left - self.left_card.right - 2 * gap,
             card_h,
         )
-        self.chan_card = pygame.Rect(margin, top + card_h + 16, WINDOW_W - 2 * margin, 262)
-        self.motor_card = pygame.Rect(margin, self.chan_card.bottom + 16, WINDOW_W - 2 * margin, 132)
+        self.chan_card = pygame.Rect(
+            margin, self.left_card.bottom + gap, WINDOW_W - 2 * margin, 200
+        )
+        self.motor_card = pygame.Rect(
+            margin, self.chan_card.bottom + gap, WINDOW_W - 2 * margin, 110
+        )
 
-        self.gimbal_r = 108
-        gy = self.left_card.y + 128
+        self.gimbal_r = 70
+        gy = self.left_card.y + 110
         self.left_center = (self.left_card.centerx, gy)
         self.right_center = (self.right_card.centerx, gy)
 
@@ -737,14 +742,12 @@ class App:
                 return
 
             if self.panel_open:
-                if event.type == pygame.KEYDOWN and event.key in (
-                    pygame.K_TAB,
-                    pygame.K_ESCAPE,
+                if (
+                    event.type == pygame.KEYDOWN
+                    and not self.panel.editing
+                    and event.key in (pygame.K_TAB, pygame.K_ESCAPE)
                 ):
                     self.panel_open = False
-                    continue
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_d and not self.panel.editing:
-                    self.panel.handle_command_key(event.key)
                     continue
                 self.panel.handle_event(event)
                 continue
@@ -906,12 +909,12 @@ class App:
 
     # ---- header ----
     def _draw_header(self) -> None:
-        bar = pygame.Rect(0, 0, WINDOW_W, 54)
+        bar = pygame.Rect(0, 0, WINDOW_W, 48)
         pygame.draw.rect(self.screen, COL_PANEL, bar)
-        pygame.draw.line(self.screen, COL_BORDER_HI, (0, 54), (WINDOW_W, 54), 1)
-        pygame.draw.rect(self.screen, COL_ACCENT, (0, 0, 4, 54))
-        self._text("BETAFLIGHT SITL", self.font_title, COL_TEXT, (22, 8))
-        self._text("JOYSTICK EMULATOR", self.font_h, COL_ACCENT, (24, 34))
+        pygame.draw.line(self.screen, COL_BORDER_HI, (0, 48), (WINDOW_W, 48), 1)
+        pygame.draw.rect(self.screen, COL_ACCENT, (0, 0, 4, 48))
+        self._text("BETAFLIGHT SITL", self.font_title, COL_TEXT, (14, 6))
+        self._text("JOYSTICK EMULATOR", self.font_h, COL_ACCENT, (16, 29))
 
         if self.sender.last_error is not None:
             status, dot_col = "SEND ERROR", COL_BAD
@@ -927,18 +930,18 @@ class App:
             (f"{self.settings.send_hz} Hz", COL_TEXT_DIM, False),
             (f"{self.sender.packets_sent:,} pkts", COL_TEXT_DIM, False),
         ]
-        x = WINDOW_W - 22
+        x = WINDOW_W - 14
         rev = list(reversed(segments))
         for idx, (text, color, dot) in enumerate(rev):
             r = self.font_mono_sm.render(text, True, color)
             x -= r.get_width()
-            self.screen.blit(r, (x, 20))
+            self.screen.blit(r, (x, 17))
             if dot:
-                _fill_circle(self.screen, x - 12, 26, 4, color)
-                x -= 22
-            if idx < len(rev) - 1:
+                _fill_circle(self.screen, x - 11, 23, 4, color)
                 x -= 20
-                self._text("|", self.font_mono_sm, COL_BORDER_HI, (x + 8, 20))
+            if idx < len(rev) - 1:
+                x -= 18
+                self._text("|", self.font_mono_sm, COL_BORDER_HI, (x + 7, 17))
 
     # ---- gimbals ----
     def _draw_gimbal_card(self, card: pygame.Rect, center, side: str) -> None:
@@ -951,7 +954,7 @@ class App:
         self._draw_gimbal(center, nx, ny, side)
 
         # Readout chips beneath the gimbal.
-        base_y = card.bottom - 46
+        base_y = card.bottom - 42
         q1 = card.x + card.w // 4
         q2 = card.x + 3 * card.w // 4
         if side == "left":
@@ -987,36 +990,36 @@ class App:
 
         grabbed = self.dragging == side
         kcol = COL_KNOB_GRAB if grabbed else COL_KNOB
-        _fill_circle(self.screen, kx, ky, 13, kcol)
-        _fill_circle(self.screen, kx, ky, 5, COL_GIMBAL)
+        _fill_circle(self.screen, kx, ky, 11, kcol)
+        _fill_circle(self.screen, kx, ky, 4, COL_GIMBAL)
 
     # ---- status / switches ----
     def _draw_status_card(self, card: pygame.Rect) -> None:
         self._panel(card, "Status")
-        inner_x = card.x + 16
-        inner_w = card.w - 32
+        inner_x = card.x + 14
+        inner_w = card.w - 28
 
         armed = self.state.armed
-        banner = pygame.Rect(inner_x, card.y + 46, inner_w, 60)
+        banner = pygame.Rect(inner_x, card.y + 44, inner_w, 50)
         if armed:
             pygame.draw.rect(self.screen, COL_GOOD, banner, border_radius=9)
-            self._text("ARMED", self.font_arm, (10, 20, 15), (banner.centerx, banner.y + 14), align="center")
+            self._text("ARMED", self.font_arm, (10, 20, 15), (banner.centerx, banner.y + 12), align="center")
         else:
             pygame.draw.rect(self.screen, COL_PANEL_LIGHT, banner, border_radius=9)
             pygame.draw.rect(self.screen, COL_BAD, banner, width=2, border_radius=9)
-            self._text("DISARMED", self.font_arm, COL_BAD, (banner.centerx, banner.y + 14), align="center")
+            self._text("DISARMED", self.font_arm, COL_BAD, (banner.centerx, banner.y + 12), align="center")
 
         # AUX toggle rows
-        ry = banner.bottom + 14
+        ry = banner.bottom + 12
         for i, on in enumerate(self.state.aux):
-            row = pygame.Rect(inner_x, ry, inner_w, 34)
+            row = pygame.Rect(inner_x, ry, inner_w, 30)
             pygame.draw.rect(self.screen, COL_PANEL_LIGHT, row, border_radius=7)
-            self._text(f"AUX {i + 1}", self.font, COL_TEXT_DIM, (row.x + 12, row.y + 8))
-            pill = pygame.Rect(row.right - 66, row.y + 6, 54, 22)
-            pygame.draw.rect(self.screen, COL_AUX if on else COL_TRACK, pill, border_radius=11)
+            self._text(f"AUX {i + 1}", self.font, COL_TEXT_DIM, (row.x + 12, row.y + 7))
+            pill = pygame.Rect(row.right - 58, row.y + 5, 48, 20)
+            pygame.draw.rect(self.screen, COL_AUX if on else COL_TRACK, pill, border_radius=10)
             self._text("ON" if on else "OFF", self.font_small,
                        COL_TEXT if on else COL_TEXT_FAINT, (pill.centerx, pill.y + 4), align="center")
-            ry += 40
+            ry += 36
 
     # ---- channels ----
     def _channel_meta(self):
@@ -1049,11 +1052,11 @@ class App:
         self._text(f"{count} ACTIVE", self.font_h, COL_TEXT_FAINT, (card.right - 16, card.y + 13), align="right")
 
         cols = 4
-        inner_x = card.x + 18
-        inner_w = card.w - 36
+        inner_x = card.x + 16
+        inner_w = card.w - 32
         col_w = inner_w // cols
-        top = card.y + 48
-        row_h = 50
+        top = card.y + 42
+        row_h = 38
         mid = self.settings.pwm_mid
 
         for i in range(count):
@@ -1077,8 +1080,8 @@ class App:
                 self._text(name, self.font_small, COL_TEXT_DIM, (colx + lw + 4, cy + 1))
 
             track_x = colx
-            track_w = col_w - 66
-            track_y = cy + 24
+            track_w = col_w - 60
+            track_y = cy + 22
             track_h = 6
             pygame.draw.rect(self.screen, COL_TRACK, (track_x, track_y, track_w, track_h), border_radius=3)
 
@@ -1111,8 +1114,8 @@ class App:
         else:
             status, scol = "WAITING", COL_WARN
         header = f"IN :{self.settings.pwm_in_port}   {status}"
-        hx = self._text(header, self.font_h, scol, (card.right - 18, card.y + 13), align="right").x
-        _fill_circle(self.screen, hx - 10, card.y + 19, 4, scol)
+        hx = self._text(header, self.font_h, scol, (card.right - 16, card.y + 13), align="right").x
+        _fill_circle(self.screen, hx - 10, card.y + 18, 4, scol)
 
         mc = rx.motor_count if rx.motor_count > 0 else 4
         total = mc
@@ -1121,12 +1124,12 @@ class App:
                 total = i + 1
         total = max(1, min(total, 16))
 
-        area_top = card.y + 46
-        area_bottom = card.bottom - 34
+        area_top = card.y + 42
+        area_bottom = card.bottom - 30
         bar_h = area_bottom - area_top
-        slot = (card.w - 40) / total
-        bar_w = int(min(52, slot - 16))
-        base_x = card.x + 20
+        slot = (card.w - 32) / total
+        bar_w = int(min(46, slot - 14))
+        base_x = card.x + 16
 
         for i in range(total):
             cx = base_x + slot * i + slot / 2
@@ -1144,10 +1147,10 @@ class App:
             pygame.draw.line(self.screen, COL_BORDER_HI, (bx, midy), (bx + bar_w, midy), 1)
 
             label = f"M{i + 1}" if is_motor else f"S{i - mc + 1}"
-            self._text(label, self.font_small, COL_TEXT_DIM, (cx, card.bottom - 30), align="center")
+            self._text(label, self.font_small, COL_TEXT_DIM, (cx, card.bottom - 27), align="center")
             vtxt = str(int(round(v))) if v > 0 else "----"
             vcol = COL_TEXT if v > 0 else COL_TEXT_FAINT
-            self._text(vtxt, self.font_mono_sm, vcol, (cx, card.bottom - 16), align="center")
+            self._text(vtxt, self.font_mono_sm, vcol, (cx, card.bottom - 15), align="center")
 
     def _draw_legend(self) -> None:
         items = [
@@ -1155,18 +1158,18 @@ class App:
             ("Drag", "sticks"), ("Enter", "arm"), ("1/2/3", "aux"),
             ("R", "reset"), ("Tab", "settings"), ("Esc", "quit"),
         ]
-        y = WINDOW_H - 30
-        x = 24
+        y = WINDOW_H - 26
+        x = 14
         for key, desc in items:
             kr = self.font_mono_sm.render(key, True, COL_ACCENT)
-            pad = 6
-            box = pygame.Rect(x, y, kr.get_width() + pad * 2, 20)
+            pad = 5
+            box = pygame.Rect(x, y, kr.get_width() + pad * 2, 18)
             pygame.draw.rect(self.screen, COL_PANEL_LIGHT, box, border_radius=5)
             pygame.draw.rect(self.screen, COL_BORDER, box, width=1, border_radius=5)
-            self.screen.blit(kr, (x + pad, y + 3))
-            x += box.width + 6
-            dr = self._text(desc, self.font_small, COL_TEXT_DIM, (x, y + 3))
-            x += dr.width + 20
+            self.screen.blit(kr, (x + pad, y + 2))
+            x += box.width + 5
+            dr = self._text(desc, self.font_small, COL_TEXT_DIM, (x, y + 2))
+            x += dr.width + 14
 
     # ------------------------------------------------------------------
     def _draw_panel(self) -> None:
@@ -1174,25 +1177,25 @@ class App:
         overlay.fill((0, 0, 0, 190))
         self.screen.blit(overlay, (0, 0))
 
-        pw, ph = 580, 632
+        pw, ph = 560, 604
         px = (WINDOW_W - pw) // 2
         py = (WINDOW_H - ph) // 2
         pygame.draw.rect(self.screen, COL_PANEL, (px, py, pw, ph), border_radius=12)
         pygame.draw.rect(self.screen, COL_BORDER_HI, (px, py, pw, ph), 1, border_radius=12)
         pygame.draw.rect(self.screen, COL_ACCENT, (px, py, pw, 3), border_top_left_radius=12, border_top_right_radius=12)
 
-        self._text("SETTINGS", self.font_title, COL_TEXT, (px + 20, py + 14))
+        self._text("SETTINGS", self.font_title, COL_TEXT, (px + 18, py + 12))
         hint_lines = [
             "Up/Down select   Left/Right adjust (Shift=coarse)   Enter edit",
             "Ctrl+S save   D defaults   Tab/Esc close",
         ]
-        hy = py + 46
+        hy = py + 40
         for line in hint_lines:
-            self.screen.blit(self.font_small.render(line, True, COL_TEXT_DIM), (px + 20, hy))
-            hy += 16
+            self.screen.blit(self.font_small.render(line, True, COL_TEXT_DIM), (px + 18, hy))
+            hy += 15
 
-        y = py + 84
-        row_h = 22
+        y = py + 76
+        row_h = 20
         panel = self.panel
         for i, f in enumerate(panel.fields):
             if f.kind == "header":
