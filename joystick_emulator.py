@@ -32,6 +32,8 @@ from pygame import gfxdraw
 
 CONFIG_FILENAME = "config.json"
 NUM_PACKET_CHANNELS = 16  # Betaflight SITL always reads a fixed 16-channel struct.
+NUM_AUX_CHANNELS = 12     # CH5..CH16 are user-configurable AUX channels.
+AUX_TYPES = ("2pos", "3pos", "slider")
 
 WINDOW_W, WINDOW_H = 880, 648
 FPS_RENDER_CAP = 120  # Rendering may run faster than the RC send rate.
@@ -110,8 +112,10 @@ class Settings:
     # Channels
     channel_order: str = "AETR"    # order of the 4 main axes on CH1-4
     channel_count: int = 16        # active channels (packet is always 16)
-    aux_low: int = 1000            # switch "off" PWM value
-    aux_high: int = 2000           # switch "on" PWM value
+    aux_low: int = 1000            # switch "off" / slider-min PWM value
+    aux_high: int = 2000           # switch "on" / slider-max PWM value
+    # Per-channel control type for CH5..CH16 (12 entries): "2pos" | "3pos" | "slider".
+    aux_types: list = field(default_factory=lambda: ["2pos"] * NUM_AUX_CHANNELS)
 
     # ------------------------------------------------------------------
     def clamp_all(self) -> None:
@@ -137,6 +141,10 @@ class Settings:
         self.channel_count = int(_clamp(self.channel_count, 4, NUM_PACKET_CHANNELS))
         self.aux_low = int(_clamp(self.aux_low, 500, 2500))
         self.aux_high = int(_clamp(self.aux_high, 500, 2500))
+        raw = list(self.aux_types) if isinstance(self.aux_types, (list, tuple)) else []
+        types = [t if t in AUX_TYPES else "2pos" for t in raw][:NUM_AUX_CHANNELS]
+        types += ["2pos"] * (NUM_AUX_CHANNELS - len(types))
+        self.aux_types = types
 
     # ------------------------------------------------------------------
     @classmethod
@@ -189,16 +197,58 @@ class RCState:
     yaw: float = 0.0
     throttle: float = 0.0
 
-    armed: bool = False           # CH5
-    aux: list = field(default_factory=lambda: [False, False, False])  # CH6, CH7, CH8
+    # Normalized [0, 1] positions for CH5..CH16. How a position maps to PWM
+    # depends on the per-channel type in Settings.aux_types. Index 0 is CH5,
+    # which conventionally arms the craft.
+    aux: list = field(default_factory=lambda: [0.0] * NUM_AUX_CHANNELS)
+
+    # Discrete positions each control type snaps to.
+    _NOTCHES = {
+        "2pos": (0.0, 1.0),
+        "3pos": (0.0, 0.5, 1.0),
+        "slider": (0.0, 0.25, 0.5, 0.75, 1.0),
+    }
+
+    @property
+    def armed(self) -> bool:
+        return self.aux[0] >= 0.5
+
+    @armed.setter
+    def armed(self, value: bool) -> None:
+        self.aux[0] = 1.0 if value else 0.0
 
     # ------------------------------------------------------------------
     def reset(self, settings: Settings) -> None:
         """Failsafe: center sticks, cut throttle to the arm-safe value, disarm."""
         self.roll = self.pitch = self.yaw = 0.0
-        self.armed = False
+        for i in range(len(self.aux)):
+            self.aux[i] = 0.0
         span = max(1, settings.pwm_max - settings.pwm_min)
         self.throttle = _clamp((settings.throttle_arm_safe - settings.pwm_min) / span, 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    def actuate(self, i: int, aux_types: list) -> None:
+        """Advance an AUX channel to its next discrete notch (wraps around)."""
+        if not 0 <= i < len(self.aux):
+            return
+        kind = aux_types[i] if i < len(aux_types) else "2pos"
+        notches = self._NOTCHES.get(kind, (0.0, 1.0))
+        cur = self.aux[i]
+        nearest = min(range(len(notches)), key=lambda k: abs(notches[k] - cur))
+        self.aux[i] = notches[(nearest + 1) % len(notches)]
+
+    def set_pos(self, i: int, pos: float, aux_types: list) -> None:
+        """Set an AUX channel from a raw [0, 1] position, quantized by its type."""
+        if not 0 <= i < len(self.aux):
+            return
+        pos = _clamp(pos, 0.0, 1.0)
+        kind = aux_types[i] if i < len(aux_types) else "2pos"
+        if kind == "2pos":
+            self.aux[i] = 1.0 if pos >= 0.5 else 0.0
+        elif kind == "3pos":
+            self.aux[i] = 0.0 if pos < 1 / 3 else (1.0 if pos > 2 / 3 else 0.5)
+        else:
+            self.aux[i] = pos
 
     # ------------------------------------------------------------------
     def to_channels(self, settings: Settings) -> list:
@@ -216,14 +266,16 @@ class RCState:
                 val = _shape_axis(getattr(self, attr), settings)
                 chans[idx] = _axis_to_pwm(val, settings)
 
-        # Switch channels (CH5 = ARM, CH6-8 = AUX).
-        switch_states = [self.armed] + list(self.aux)
-        for i, on in enumerate(switch_states):
+        # AUX channels CH5..CH16, each mapped per its configured type.
+        types = settings.aux_types
+        for i in range(len(self.aux)):
             ch = 4 + i  # CH5 -> index 4
-            if ch < NUM_PACKET_CHANNELS:
-                chans[ch] = settings.aux_high if on else settings.aux_low
+            if ch >= NUM_PACKET_CHANNELS:
+                break
+            kind = types[i] if i < len(types) else "2pos"
+            chans[ch] = _aux_to_pwm(self.aux[i], kind, settings)
 
-        # Zero out inactive channels beyond channel_count to the mid value.
+        # Channels beyond the active count sit at the mid value.
         for ch in range(settings.channel_count, NUM_PACKET_CHANNELS):
             chans[ch] = settings.pwm_mid
 
@@ -254,6 +306,20 @@ def _axis_to_pwm(x: float, settings: Settings) -> int:
 def _throttle_to_pwm(t: float, settings: Settings) -> int:
     t = _clamp(t, 0.0, 1.0)
     return round(settings.pwm_min + t * (settings.pwm_max - settings.pwm_min))
+
+
+def _aux_to_pwm(pos: float, kind: str, settings: Settings) -> int:
+    """Map an AUX position [0, 1] to PWM according to its control type."""
+    pos = _clamp(pos, 0.0, 1.0)
+    if kind == "3pos":
+        if pos <= 0.25:
+            return settings.aux_low
+        if pos >= 0.75:
+            return settings.aux_high
+        return settings.pwm_mid
+    if kind == "slider":
+        return round(settings.aux_low + pos * (settings.aux_high - settings.aux_low))
+    return settings.aux_high if pos >= 0.5 else settings.aux_low
 
 
 # ---------------------------------------------------------------------------
@@ -754,34 +820,70 @@ class App:
 
             if event.type == pygame.KEYDOWN:
                 self._handle_flight_keydown(event)
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                self._handle_mouse_down(event.pos)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+                self._handle_mouse_down(event.pos, event.button)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.dragging = None
 
-    def _handle_flight_keydown(self, event: pygame.event.Event) -> None:
-        if event.key == pygame.K_ESCAPE:
-            self.running = False
-        elif event.key == pygame.K_TAB:
-            self.panel_open = True
-        elif event.key == pygame.K_RETURN:
-            self.state.armed = not self.state.armed
-        elif event.key == pygame.K_r:
-            self.state.reset(self.settings)
-        elif event.key == pygame.K_1:
-            self.state.aux[0] = not self.state.aux[0]
-        elif event.key == pygame.K_2:
-            self.state.aux[1] = not self.state.aux[1]
-        elif event.key == pygame.K_3:
-            self.state.aux[2] = not self.state.aux[2]
+    # Number-row keys actuate CH6..CH15 (1->CH6 ... 9->CH14, 0->CH15).
+    _NUM_KEY_AUX = {
+        pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4, pygame.K_5: 5,
+        pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9, pygame.K_0: 10,
+    }
 
-    def _handle_mouse_down(self, pos) -> None:
-        if _dist(pos, self.left_center) <= self.gimbal_r:
-            self.dragging = "left"
-            self._drag_stick(pos)
-        elif _dist(pos, self.right_center) <= self.gimbal_r:
-            self.dragging = "right"
-            self._drag_stick(pos)
+    def _handle_flight_keydown(self, event: pygame.event.Event) -> None:
+        key = event.key
+        if key == pygame.K_ESCAPE:
+            self.running = False
+        elif key == pygame.K_TAB:
+            self.panel_open = True
+        elif key == pygame.K_RETURN:
+            self._actuate_aux(0)  # CH5 (arm)
+        elif key == pygame.K_r:
+            self.state.reset(self.settings)
+        elif key in self._NUM_KEY_AUX:
+            self._actuate_aux(self._NUM_KEY_AUX[key])
+
+    def _actuate_aux(self, idx: int) -> None:
+        """Advance an AUX channel a notch, if that channel is active."""
+        if 4 + idx >= self.settings.channel_count:
+            return
+        self.state.actuate(idx, self.settings.aux_types)
+
+    def _cycle_aux_type(self, idx: int) -> None:
+        """Cycle a channel's control type (2pos -> 3pos -> slider) and persist it."""
+        cur = self.settings.aux_types[idx]
+        nxt = AUX_TYPES[(AUX_TYPES.index(cur) + 1) % len(AUX_TYPES)] if cur in AUX_TYPES else "2pos"
+        self.settings.aux_types[idx] = nxt
+        # Re-quantize the current position for the new type.
+        self.state.set_pos(idx, self.state.aux[idx], self.settings.aux_types)
+        self.settings.save(self.config_path)
+
+    def _handle_mouse_down(self, pos, button: int) -> None:
+        if button == 1:
+            if _dist(pos, self.left_center) <= self.gimbal_r:
+                self.dragging = "left"
+                self._drag_stick(pos)
+                return
+            if _dist(pos, self.right_center) <= self.gimbal_r:
+                self.dragging = "right"
+                self._drag_stick(pos)
+                return
+
+        hit = self._channel_hit(pos)
+        if hit is None:
+            return
+        idx, frac = hit
+        if 4 + idx >= self.settings.channel_count:
+            return
+        if button == 3:
+            self._cycle_aux_type(idx)
+            return
+        if self.settings.aux_types[idx] == "slider":
+            self.dragging = ("aux", idx)
+            self.state.set_pos(idx, frac, self.settings.aux_types)
+        else:
+            self.state.actuate(idx, self.settings.aux_types)
 
     def _drag_stick(self, pos) -> None:
         if self.dragging == "left":
@@ -793,11 +895,22 @@ class App:
             self.state.roll = nx
             self.state.pitch = -ny
 
+    def _drag_aux(self, idx: int) -> None:
+        mx = pygame.mouse.get_pos()[0]
+        for e in self._channel_layout():
+            if e["i"] == 4 + idx:
+                frac = _clamp((mx - e["track_x"]) / max(1, e["track_w"]), 0.0, 1.0)
+                self.state.set_pos(idx, frac, self.settings.aux_types)
+                return
+
     # ------------------------------------------------------------------
     # Continuous input update
     # ------------------------------------------------------------------
     def _update_inputs(self, dt: float) -> None:
-        if self.dragging is not None:
+        if isinstance(self.dragging, tuple) and self.dragging[0] == "aux":
+            self._drag_aux(self.dragging[1])
+            return
+        if self.dragging in ("left", "right"):
             self._drag_stick(pygame.mouse.get_pos())
             # While dragging one stick, the other still self-centers.
             if self.dragging == "left":
@@ -1009,19 +1122,52 @@ class App:
             pygame.draw.rect(self.screen, COL_BAD, banner, width=2, border_radius=9)
             self._text("DISARMED", self.font_arm, COL_BAD, (banner.centerx, banner.y + 12), align="center")
 
-        # AUX toggle rows
-        ry = banner.bottom + 12
-        for i, on in enumerate(self.state.aux):
-            row = pygame.Rect(inner_x, ry, inner_w, 30)
-            pygame.draw.rect(self.screen, COL_PANEL_LIGHT, row, border_radius=7)
-            self._text(f"AUX {i + 1}", self.font, COL_TEXT_DIM, (row.x + 12, row.y + 7))
-            pill = pygame.Rect(row.right - 58, row.y + 5, 48, 20)
-            pygame.draw.rect(self.screen, COL_AUX if on else COL_TRACK, pill, border_radius=10)
-            self._text("ON" if on else "OFF", self.font_small,
-                       COL_TEXT if on else COL_TEXT_FAINT, (pill.centerx, pill.y + 4), align="center")
-            ry += 36
+        # AUX control help. CH5..CH16 are actuated directly in the Channels panel.
+        hints = [
+            ("CH5-16", "AUX switches"),
+            ("Left-click", "actuate / cycle"),
+            ("Right-click", "change type"),
+            ("Enter / 1-0", "CH5 / CH6-15"),
+        ]
+        hy = banner.bottom + 14
+        for key, desc in hints:
+            self._text(key, self.font_h, COL_ACCENT, (inner_x + 2, hy))
+            self._text(desc, self.font_small, COL_TEXT_DIM, (inner_x + 88, hy))
+            hy += 18
+        self._text("2P 2-pos   3P 3-pos   SL slider", self.font_small,
+                   COL_TEXT_FAINT, (inner_x + 2, hy + 4))
 
     # ---- channels ----
+    def _channel_layout(self):
+        """Per-channel cell/track geometry, shared by drawing and hit-testing."""
+        card = self.chan_card
+        cols = 4
+        inner_x = card.x + 16
+        inner_w = card.w - 32
+        col_w = inner_w // cols
+        top = card.y + 42
+        row_h = 38
+        out = []
+        for i in range(self.settings.channel_count):
+            colx = inner_x + (i % cols) * col_w
+            cy = top + (i // cols) * row_h
+            out.append({
+                "i": i, "colx": colx, "cy": cy, "col_w": col_w, "row_h": row_h,
+                "track_x": colx, "track_y": cy + 22, "track_w": col_w - 60, "track_h": 6,
+            })
+        return out
+
+    def _channel_hit(self, pos):
+        """Return (aux_index, track_fraction) for an AUX channel cell under pos."""
+        for e in self._channel_layout():
+            if e["i"] < 4:
+                continue
+            cell = pygame.Rect(e["colx"], e["cy"] - 2, e["col_w"] - 6, e["row_h"] - 4)
+            if cell.collidepoint(pos):
+                frac = _clamp((pos[0] - e["track_x"]) / max(1, e["track_w"]), 0.0, 1.0)
+                return e["i"] - 4, frac
+        return None
+
     def _channel_meta(self):
         fnmap = {
             "A": ("Roll", COL_ACCENT, True),
@@ -1037,12 +1183,12 @@ class App:
                 name, col, bip = fnmap.get(letter, ("?", COL_MUTED, True))
                 meta.append((name, col, bip, "axis"))
             elif i == 4:
-                meta.append(("Arm", COL_GOOD, False, "arm"))
-            elif i in (5, 6, 7):
-                meta.append((f"Aux{i - 4}", COL_AUX, False, "aux"))
+                meta.append(("Arm", COL_GOOD, False, "aux"))
             else:
-                meta.append(("", COL_MUTED, False, "other"))
+                meta.append((f"Aux{i - 4}", COL_AUX, False, "aux"))
         return meta
+
+    _TYPE_BADGE = {"2pos": "2P", "3pos": "3P", "slider": "SL"}
 
     def _draw_channels(self, card: pygame.Rect) -> None:
         self._panel(card, "Channels")
@@ -1051,27 +1197,24 @@ class App:
         count = self.settings.channel_count
         self._text(f"{count} ACTIVE", self.font_h, COL_TEXT_FAINT, (card.right - 16, card.y + 13), align="right")
 
-        cols = 4
-        inner_x = card.x + 16
-        inner_w = card.w - 32
-        col_w = inner_w // cols
-        top = card.y + 42
-        row_h = 38
         mid = self.settings.pwm_mid
+        mouse = pygame.mouse.get_pos()
 
-        for i in range(count):
+        for e in self._channel_layout():
+            i = e["i"]
             name, col, bipolar, kind = meta[i]
             val = chans[i]
-            row = i // cols
-            colx = inner_x + (i % cols) * col_w
-            cy = top + row * row_h
+            colx, cy, col_w = e["colx"], e["cy"], e["col_w"]
+            is_aux = i >= 4
 
-            active = True
-            if kind == "arm":
-                active = self.state.armed
-            elif kind == "aux":
-                active = val >= mid
+            active = val >= mid if kind == "aux" else True
             draw_col = col if active else COL_MUTED
+
+            # Highlight the AUX cell under the cursor to signal it is clickable.
+            if is_aux:
+                cell = pygame.Rect(colx, cy - 2, col_w - 6, e["row_h"] - 4)
+                if cell.collidepoint(mouse):
+                    pygame.draw.rect(self.screen, COL_PANEL_LIGHT, cell, border_radius=5)
 
             label = f"CH{i + 1}"
             self._text(label, self.font_mono_sm, COL_TEXT, (colx, cy))
@@ -1079,10 +1222,12 @@ class App:
                 lw = self.font_mono_sm.size(label + " ")[0]
                 self._text(name, self.font_small, COL_TEXT_DIM, (colx + lw + 4, cy + 1))
 
-            track_x = colx
-            track_w = col_w - 60
-            track_y = cy + 22
-            track_h = 6
+            if is_aux:
+                badge = self._TYPE_BADGE.get(self.settings.aux_types[i - 4], "2P")
+                self._text(badge, self.font_small, COL_ACCENT_DIM, (colx + col_w - 12, cy), align="right")
+
+            track_x, track_y = e["track_x"], e["track_y"]
+            track_w, track_h = e["track_w"], e["track_h"]
             pygame.draw.rect(self.screen, COL_TRACK, (track_x, track_y, track_w, track_h), border_radius=3)
 
             frac = _clamp((val - 1000) / 1000.0, 0.0, 1.0)
@@ -1098,8 +1243,7 @@ class App:
                 pygame.draw.rect(self.screen, draw_col,
                                  (track_x, track_y, max(2, int(frac * track_w)), track_h), border_radius=3)
 
-            vcol = draw_col if kind in ("arm", "aux") else COL_TEXT
-            self._text(str(val), self.font_mono_sm, vcol, (colx + col_w - 12, cy + 12), align="right")
+            self._text(str(val), self.font_mono_sm, draw_col, (colx + col_w - 12, cy + 12), align="right")
 
     def _draw_motors_card(self, card: pygame.Rect) -> None:
         self._panel(card, "Motor / PWM Output")
@@ -1155,8 +1299,8 @@ class App:
     def _draw_legend(self) -> None:
         items = [
             ("W/S", "throttle"), ("A/D", "yaw"), ("Arrows", "pitch/roll"),
-            ("Drag", "sticks"), ("Enter", "arm"), ("1/2/3", "aux"),
-            ("R", "reset"), ("Tab", "settings"), ("Esc", "quit"),
+            ("Drag", "sticks"), ("Enter", "arm"), ("1-0", "aux"),
+            ("Click", "aux CH"), ("R", "reset"), ("Tab", "settings"), ("Esc", "quit"),
         ]
         y = WINDOW_H - 26
         x = 14

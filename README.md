@@ -114,13 +114,36 @@ python joystick_emulator.py --ip 127.0.0.1 --port 9004 --hz 50
 Roll, pitch and yaw spring back to center when released. Throttle stays where
 you leave it (configurable via **Sticky throttle**).
 
-### Switches / commands
+### AUX channels (CH5–CH16)
+
+CH5–CH16 are fully configurable AUX channels. Each one has a **control type**
+you can change on the fly:
+
+| Type       | Badge | Behavior                                             |
+|------------|-------|------------------------------------------------------|
+| 2-position | `2P`  | Toggles between AUX low / AUX high                   |
+| 3-position | `3P`  | Cycles AUX low → mid (`PWM mid`) → AUX high          |
+| Slider     | `SL`  | Any value between AUX low and AUX high (drag it)     |
+
+Control them directly in the **Channels** panel:
+
+| Input                    | Action                                             |
+|--------------------------|----------------------------------------------------|
+| Left-click a channel     | Actuate: toggle (`2P`), cycle (`3P`), or set (`SL`)|
+| Drag a slider channel    | Set a continuous value (`SL` type only)            |
+| Right-click a channel    | Cycle its control type (`2P` → `3P` → `SL`), saved |
+| `Enter`                  | Actuate CH5 (ARM)                                  |
+| `1`…`9`, `0`             | Actuate CH6…CH15 (`1`→CH6 … `9`→CH14, `0`→CH15)    |
+
+CH5 conventionally arms the craft (its `2P` high = armed). The number of active
+AUX channels follows **Active channels** in the settings panel; channels beyond
+that count are held at `PWM mid`. Types are stored per-channel in `config.json`.
+
+### Commands
 
 | Key     | Action                                        |
 |---------|-----------------------------------------------|
-| `Enter` | Toggle ARM (CH5)                              |
-| `1`/`2`/`3` | Toggle AUX 1-3 (CH6-CH8)                  |
-| `R`     | Reset / failsafe (center sticks, cut throttle, disarm) |
+| `R`     | Reset / failsafe (center sticks, cut throttle, disarm all AUX) |
 | `Tab`   | Open / close the settings panel               |
 | `Esc`   | Quit                                          |
 
@@ -157,8 +180,10 @@ effect on the next frame.
   speed), `Deadband`, `Expo`
 - **Throttle**: `Sticky throttle` (hold vs. auto-decay), `Arm-safe throttle PWM`
   (value applied on reset)
-- **Channels**: `Channel order` (permutation of `AETR`), `Active channels`,
-  `AUX low PWM` / `AUX high PWM`
+- **Channels**: `Channel order` (permutation of `AETR`), `Active channels`
+  (how many of CH1–CH16 are live), `AUX low PWM` / `AUX high PWM` (the low/high
+  endpoints shared by all AUX channels; per-channel types are set by right-click
+  in the Channels panel)
 
 ## Configuration file
 
