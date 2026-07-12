@@ -18,6 +18,7 @@ import os
 import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Callable, Optional
@@ -297,8 +298,30 @@ class RCSender:
 # ---------------------------------------------------------------------------
 
 
+class PWMSnapshot:
+    """Immutable view of the receiver state, safe to read on the main thread."""
+
+    __slots__ = ("enabled", "bound", "error", "motor_count", "values", "last_rx", "packets")
+
+    def __init__(self, enabled, bound, error, motor_count, values, last_rx, packets):
+        self.enabled = enabled
+        self.bound = bound
+        self.error = error
+        self.motor_count = motor_count
+        self.values = values
+        self.last_rx = last_rx
+        self.packets = packets
+
+    def connected(self, timeout: float) -> bool:
+        return self.bound and (time.time() - self.last_rx) < timeout
+
+
 class PWMReceiver:
     """Listens for the SITL's raw PWM output (servo_packet_raw) on a UDP port.
+
+    Runs on a dedicated daemon thread that blocks on ``recvfrom`` (with a short
+    timeout so it can be stopped cleanly). The most recent packet is stored under
+    a lock; the render loop reads a consistent view via :meth:`snapshot`.
 
     Packet layout (little-endian, natural C alignment):
         uint16_t motorCount;
@@ -308,6 +331,7 @@ class PWMReceiver:
     """
 
     RX_TIMEOUT = 1.5  # seconds without a packet => considered "waiting"
+    _SOCK_TIMEOUT = 0.2  # recv timeout so the thread can observe the stop flag
     _S_PADDED = struct.Struct("<H2x16f")   # 68 bytes (default C alignment)
     _S_PACKED = struct.Struct("<H16f")     # 66 bytes (packed builds)
 
@@ -315,67 +339,93 @@ class PWMReceiver:
         self.port = port
         self.enabled = enabled
         self.bind_ip = bind_ip
-        self.sock: Optional[socket.socket] = None
-        self.error: Optional[str] = None
 
-        self.motor_count = 0
-        self.values = [0.0] * 16
-        self.last_rx = 0.0
-        self.packets = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._sock: Optional[socket.socket] = None
+
+        # Shared state (guarded by _lock).
+        self._bound = False
+        self._error: Optional[str] = None
+        self._motor_count = 0
+        self._values = [0.0] * 16
+        self._last_rx = 0.0
+        self._packets = 0
 
         if enabled:
-            self._open()
+            self._start()
 
-    def _open(self) -> None:
+    # ---- lifecycle ----
+    def _start(self) -> None:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.setblocking(False)
+            s.settimeout(self._SOCK_TIMEOUT)
             s.bind((self.bind_ip, self.port))
-            self.sock = s
-            self.error = None
+            self._sock = s
+            with self._lock:
+                self._bound = True
+                self._error = None
         except OSError as exc:
-            self.sock = None
-            self.error = str(exc)
+            self._sock = None
+            with self._lock:
+                self._bound = False
+                self._error = str(exc)
+            return
 
-    def _close(self) -> None:
-        if self.sock is not None:
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="pwm-rx", daemon=True)
+        self._thread.start()
+
+    def _stop_thread(self) -> None:
+        self._stop.set()
+        sock = self._sock
+        if sock is not None:
             try:
-                self.sock.close()
+                sock.close()   # unblocks a pending recvfrom
             except OSError:
                 pass
-            self.sock = None
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._thread = None
+        self._sock = None
+        with self._lock:
+            self._bound = False
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            sock = self._sock
+            if sock is None:
+                break
+            try:
+                data, _addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if not self._stop.is_set():
+                    with self._lock:
+                        self._error = str(exc)
+                        self._bound = False
+                break
+            parsed = self._parse(data)
+            if parsed is not None:
+                mc, vals = parsed
+                with self._lock:
+                    self._motor_count = mc
+                    self._values = vals
+                    self._last_rx = time.time()
+                    self._packets += 1
 
     def reconfigure(self, port: int, enabled: bool) -> None:
         if port == self.port and enabled == self.enabled:
             return
+        self._stop_thread()
         self.port = port
         self.enabled = enabled
-        self._close()
         if enabled:
-            self._open()
-
-    def poll(self) -> None:
-        """Drain the socket and keep the most recent packet."""
-        if self.sock is None:
-            return
-        latest = None
-        for _ in range(128):
-            try:
-                data, _addr = self.sock.recvfrom(2048)
-            except (BlockingIOError, InterruptedError):
-                break
-            except OSError as exc:
-                self.error = str(exc)
-                break
-            latest = data
-        if latest is None:
-            return
-        parsed = self._parse(latest)
-        if parsed is not None:
-            self.motor_count, self.values = parsed
-            self.last_rx = time.time()
-            self.packets += 1
+            self._start()
 
     def _parse(self, data: bytes):
         if len(data) >= self._S_PADDED.size:
@@ -387,11 +437,20 @@ class PWMReceiver:
         motor_count = min(int(vals[0]), 16)
         return motor_count, list(vals[1:17])
 
-    def connected(self) -> bool:
-        return self.sock is not None and (time.time() - self.last_rx) < self.RX_TIMEOUT
+    def snapshot(self) -> PWMSnapshot:
+        with self._lock:
+            return PWMSnapshot(
+                self.enabled,
+                self._bound,
+                self._error,
+                self._motor_count,
+                list(self._values),
+                self._last_rx,
+                self._packets,
+            )
 
     def close(self) -> None:
-        self._close()
+        self._stop_thread()
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +714,6 @@ class App:
             if not self.panel_open:
                 self._update_inputs(dt)
             self._maybe_send(dt)
-            self.pwm_in.poll()
             self._render()
         self._shutdown()
 
@@ -1022,13 +1080,13 @@ class App:
 
     def _draw_motors_card(self, card: pygame.Rect) -> None:
         self._panel(card, "Motor / PWM Output")
-        rx = self.pwm_in
+        rx = self.pwm_in.snapshot()
 
         if not rx.enabled:
             status, scol = "DISABLED", COL_TEXT_FAINT
         elif rx.error:
             status, scol = "BIND ERROR", COL_BAD
-        elif rx.connected():
+        elif rx.connected(PWMReceiver.RX_TIMEOUT):
             status, scol = "RECEIVING", COL_GOOD
         else:
             status, scol = "WAITING", COL_WARN
