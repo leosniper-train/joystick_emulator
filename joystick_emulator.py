@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Callable, Optional
 
 import pygame
+from pygame import gfxdraw
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -31,25 +32,42 @@ import pygame
 CONFIG_FILENAME = "config.json"
 NUM_PACKET_CHANNELS = 16  # Betaflight SITL always reads a fixed 16-channel struct.
 
-WINDOW_W, WINDOW_H = 940, 640
+WINDOW_W, WINDOW_H = 1060, 720
 FPS_RENDER_CAP = 120  # Rendering may run faster than the RC send rate.
 
-# Colors
-COL_BG = (18, 20, 26)
-COL_PANEL = (28, 31, 40)
-COL_PANEL_LIGHT = (38, 42, 54)
-COL_ACCENT = (64, 156, 255)
-COL_TEXT = (222, 226, 235)
-COL_TEXT_DIM = (140, 146, 160)
-COL_GIMBAL = (44, 48, 60)
-COL_GIMBAL_RING = (70, 76, 92)
-COL_KNOB = (64, 156, 255)
-COL_KNOB_GRAB = (120, 190, 255)
-COL_GOOD = (72, 199, 116)
-COL_BAD = (224, 82, 82)
-COL_WARN = (240, 180, 60)
-COL_BAR_BG = (46, 50, 62)
-COL_BAR_FILL = (64, 156, 255)
+# ---- Palette (modern dark "avionics" theme) ----
+COL_BG_TOP = (16, 19, 26)
+COL_BG_BOT = (10, 12, 17)
+COL_PANEL = (23, 27, 35)
+COL_PANEL_LIGHT = (33, 39, 50)
+COL_BORDER = (42, 49, 62)
+COL_BORDER_HI = (58, 68, 86)
+
+COL_ACCENT = (56, 189, 248)      # sky blue - primary axes
+COL_ACCENT_DIM = (34, 108, 145)
+COL_THROTTLE = (245, 176, 66)    # amber - throttle
+COL_AUX = (167, 139, 250)        # violet - aux switches
+COL_MUTED = (90, 102, 120)       # unused channels
+
+COL_TEXT = (231, 236, 244)
+COL_TEXT_DIM = (140, 149, 165)
+COL_TEXT_FAINT = (96, 105, 122)
+
+COL_GIMBAL = (18, 21, 28)
+COL_GIMBAL_RING = (48, 56, 72)
+COL_GIMBAL_GRID = (36, 43, 55)
+COL_KNOB = (56, 189, 248)
+COL_KNOB_GRAB = (125, 211, 252)
+
+COL_GOOD = (52, 211, 153)        # armed / connected (green)
+COL_BAD = (248, 113, 113)        # disarmed / error (red)
+COL_WARN = (245, 176, 66)
+COL_TRACK = (30, 35, 45)
+
+# Backwards-compatible aliases used elsewhere
+COL_BG = COL_BG_TOP
+COL_BAR_BG = COL_TRACK
+COL_BAR_FILL = COL_ACCENT
 
 
 # ---------------------------------------------------------------------------
@@ -480,14 +498,38 @@ class App:
         pygame.display.set_caption("Betaflight SITL Joystick Emulator")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("consolas", 16)
-        self.font_small = pygame.font.SysFont("consolas", 13)
-        self.font_big = pygame.font.SysFont("consolas", 20, bold=True)
 
-        # Gimbal geometry
-        self.gimbal_r = 120
-        self.left_center = (250, 250)
-        self.right_center = (WINDOW_W - 250, 250)
+        # Typography: UI font for labels, mono font for numeric readouts.
+        self.font_title = _sysfont(["Segoe UI Semibold", "Segoe UI", "Arial"], 22, bold=True)
+        self.font_h = _sysfont(["Segoe UI", "Arial"], 12, bold=True)
+        self.font = _sysfont(["Segoe UI", "Arial"], 15)
+        self.font_small = _sysfont(["Segoe UI", "Arial"], 12)
+        self.font_mono = _sysfont(["Consolas", "Courier New"], 15)
+        self.font_mono_sm = _sysfont(["Consolas", "Courier New"], 12)
+        self.font_arm = _sysfont(["Segoe UI Black", "Segoe UI", "Arial"], 26, bold=True)
+
+        # Cached vertical-gradient background.
+        self.bg = _make_gradient(WINDOW_W, WINDOW_H, COL_BG_TOP, COL_BG_BOT)
+
+        # ---- Layout geometry ----
+        margin = 22
+        top = 66
+        card_w = 372
+        card_h = 300
+        self.left_card = pygame.Rect(margin, top, card_w, card_h)
+        self.right_card = pygame.Rect(WINDOW_W - margin - card_w, top, card_w, card_h)
+        self.center_card = pygame.Rect(
+            self.left_card.right + 16,
+            top,
+            self.right_card.left - self.left_card.right - 32,
+            card_h,
+        )
+        self.chan_card = pygame.Rect(margin, top + card_h + 16, WINDOW_W - 2 * margin, 262)
+
+        self.gimbal_r = 108
+        gy = self.left_card.y + 128
+        self.left_center = (self.left_card.centerx, gy)
+        self.right_center = (self.right_card.centerx, gy)
 
     # ------------------------------------------------------------------
     def _on_settings_changed(self) -> None:
@@ -644,174 +686,297 @@ class App:
     # Rendering
     # ------------------------------------------------------------------
     def _render(self) -> None:
-        self.screen.fill(COL_BG)
+        self.screen.blit(self.bg, (0, 0))
         self._draw_header()
-        self._draw_gimbal(self.left_center, self.state.yaw, 1.0 - self.state.throttle * 2, "THROTTLE / YAW")
-        self._draw_gimbal(self.right_center, self.state.roll, -self.state.pitch, "PITCH / ROLL")
-        self._draw_channels()
-        self._draw_switches()
+        self._draw_gimbal_card(self.left_card, self.left_center, "left")
+        self._draw_gimbal_card(self.right_card, self.right_center, "right")
+        self._draw_status_card(self.center_card)
+        self._draw_channels(self.chan_card)
         self._draw_legend()
         if self.panel_open:
             self._draw_panel()
         pygame.display.flip()
 
-    def _draw_header(self) -> None:
-        target = f"{self.settings.ip}:{self.settings.port}"
-        txt = self.font_big.render("Betaflight SITL Joystick Emulator", True, COL_TEXT)
-        self.screen.blit(txt, (20, 14))
-        info = f"UDP -> {target}   {self.settings.send_hz} Hz   sent {self.sender.packets_sent}"
-        color = COL_GOOD if self.sender.last_error is None else COL_BAD
-        self.screen.blit(self.font.render(info, True, color), (20, 44))
-        if self.sender.last_error:
-            self.screen.blit(
-                self.font_small.render(f"send error: {self.sender.last_error}", True, COL_BAD),
-                (20, 64),
-            )
+    # ---- shared helpers ----
+    def _panel(self, rect: pygame.Rect, title: Optional[str] = None) -> None:
+        pygame.draw.rect(self.screen, COL_PANEL, rect, border_radius=12)
+        pygame.draw.rect(self.screen, COL_BORDER, rect, width=1, border_radius=12)
+        if title:
+            self._text(title.upper(), self.font_h, COL_TEXT_FAINT, (rect.x + 16, rect.y + 13))
+            ly = rect.y + 34
+            pygame.draw.line(self.screen, COL_BORDER, (rect.x + 14, ly), (rect.right - 14, ly), 1)
 
-    def _draw_gimbal(self, center, nx: float, ny: float, label: str) -> None:
+    def _text(self, s: str, font, color, pos, align: str = "left") -> pygame.Rect:
+        surf = font.render(s, True, color)
+        x, y = pos
+        if align == "center":
+            x -= surf.get_width() // 2
+        elif align == "right":
+            x -= surf.get_width()
+        self.screen.blit(surf, (int(x), int(y)))
+        return surf.get_rect(topleft=(int(x), int(y)))
+
+    # ---- header ----
+    def _draw_header(self) -> None:
+        bar = pygame.Rect(0, 0, WINDOW_W, 54)
+        pygame.draw.rect(self.screen, COL_PANEL, bar)
+        pygame.draw.line(self.screen, COL_BORDER_HI, (0, 54), (WINDOW_W, 54), 1)
+        pygame.draw.rect(self.screen, COL_ACCENT, (0, 0, 4, 54))
+        self._text("BETAFLIGHT SITL", self.font_title, COL_TEXT, (22, 8))
+        self._text("JOYSTICK EMULATOR", self.font_h, COL_ACCENT, (24, 34))
+
+        ok = self.sender.last_error is None
+        dot_col = COL_GOOD if ok else COL_BAD
+        status = "READY" if ok else "SEND ERROR"
+        segments = [
+            (status, dot_col, True),
+            (f"{self.settings.ip}:{self.settings.port}", COL_TEXT, False),
+            (f"{self.settings.send_hz} Hz", COL_TEXT_DIM, False),
+            (f"{self.sender.packets_sent:,} pkts", COL_TEXT_DIM, False),
+        ]
+        x = WINDOW_W - 22
+        rev = list(reversed(segments))
+        for idx, (text, color, dot) in enumerate(rev):
+            r = self.font_mono_sm.render(text, True, color)
+            x -= r.get_width()
+            self.screen.blit(r, (x, 20))
+            if dot:
+                _fill_circle(self.screen, x - 12, 26, 4, color)
+                x -= 22
+            if idx < len(rev) - 1:
+                x -= 20
+                self._text("|", self.font_mono_sm, COL_BORDER_HI, (x + 8, 20))
+
+    # ---- gimbals ----
+    def _draw_gimbal_card(self, card: pygame.Rect, center, side: str) -> None:
+        label = "THROTTLE / YAW" if side == "left" else "ROLL / PITCH"
+        self._panel(card, label)
+        if side == "left":
+            nx, ny = self.state.yaw, 1.0 - self.state.throttle * 2
+        else:
+            nx, ny = self.state.roll, -self.state.pitch
+        self._draw_gimbal(center, nx, ny, side)
+
+        # Readout chips beneath the gimbal.
+        base_y = card.bottom - 46
+        q1 = card.x + card.w // 4
+        q2 = card.x + 3 * card.w // 4
+        if side == "left":
+            self._readout(q1, base_y, "THROTTLE", f"{round(self.state.throttle * 100)}%", COL_THROTTLE)
+            self._readout(q2, base_y, "YAW", _pct(self.state.yaw), COL_ACCENT)
+        else:
+            self._readout(q1, base_y, "ROLL", _pct(self.state.roll), COL_ACCENT)
+            self._readout(q2, base_y, "PITCH", _pct(self.state.pitch), COL_ACCENT)
+
+    def _readout(self, cx: int, top: int, label: str, value: str, color) -> None:
+        self._text(label, self.font_small, COL_TEXT_DIM, (cx, top), align="center")
+        self._text(value, self.font_mono, color, (cx, top + 16), align="center")
+
+    def _draw_gimbal(self, center, nx: float, ny: float, side: str) -> None:
         cx, cy = center
         r = self.gimbal_r
-        pygame.draw.circle(self.screen, COL_GIMBAL, center, r)
-        pygame.draw.circle(self.screen, COL_GIMBAL_RING, center, r, 2)
-        pygame.draw.line(self.screen, COL_GIMBAL_RING, (cx - r, cy), (cx + r, cy), 1)
-        pygame.draw.line(self.screen, COL_GIMBAL_RING, (cx, cy - r), (cx, cy + r), 1)
+        _fill_circle(self.screen, cx, cy, r, COL_GIMBAL)
+        # concentric guide rings + crosshair
+        for rr in (int(r * 0.34), int(r * 0.67)):
+            gfxdraw.aacircle(self.screen, cx, cy, rr, COL_GIMBAL_GRID)
+        pygame.draw.line(self.screen, COL_GIMBAL_GRID, (cx - r, cy), (cx + r, cy), 1)
+        pygame.draw.line(self.screen, COL_GIMBAL_GRID, (cx, cy - r), (cx, cy + r), 1)
+        gfxdraw.aacircle(self.screen, cx, cy, r, COL_GIMBAL_RING)
+        gfxdraw.aacircle(self.screen, cx, cy, r - 1, COL_GIMBAL_RING)
+
         kx = cx + _clamp(nx, -1, 1) * r
         ky = cy + _clamp(ny, -1, 1) * r
-        grabbed = (self.dragging == "left" and label.startswith("THROTTLE")) or (
-            self.dragging == "right" and label.startswith("PITCH")
-        )
-        pygame.draw.circle(self.screen, COL_KNOB_GRAB if grabbed else COL_KNOB, (int(kx), int(ky)), 16)
-        pygame.draw.circle(self.screen, COL_BG, (int(kx), int(ky)), 16, 2)
-        lbl = self.font_small.render(label, True, COL_TEXT_DIM)
-        self.screen.blit(lbl, (cx - lbl.get_width() // 2, cy + r + 10))
+        # reticle projection lines clipped to the circle
+        dxr = math.sqrt(max(0.0, r * r - (ky - cy) ** 2))
+        dyr = math.sqrt(max(0.0, r * r - (kx - cx) ** 2))
+        pygame.draw.line(self.screen, COL_ACCENT_DIM, (cx - dxr, ky), (cx + dxr, ky), 1)
+        pygame.draw.line(self.screen, COL_ACCENT_DIM, (kx, cy - dyr), (kx, cy + dyr), 1)
 
-    def _channel_labels(self) -> list:
-        base = {"A": "Roll", "E": "Pitch", "T": "Thr", "R": "Yaw"}
-        labels = []
-        for i in range(self.settings.channel_count):
-            if i < 4:
-                letter = self.settings.channel_order[i] if i < len(self.settings.channel_order) else "?"
-                labels.append(f"CH{i+1} {base.get(letter, '?')}")
-            elif i == 4:
-                labels.append(f"CH{i+1} Arm")
-            elif i in (5, 6, 7):
-                labels.append(f"CH{i+1} Aux{i-4}")
-            else:
-                labels.append(f"CH{i+1}")
-        return labels
+        grabbed = self.dragging == side
+        kcol = COL_KNOB_GRAB if grabbed else COL_KNOB
+        _fill_circle(self.screen, kx, ky, 13, kcol)
+        _fill_circle(self.screen, kx, ky, 5, COL_GIMBAL)
 
-    def _draw_channels(self) -> None:
-        x0, y0 = 20, 420
-        w = WINDOW_W - 40
-        title = self.font.render("Channels", True, COL_TEXT)
-        self.screen.blit(title, (x0, y0 - 26))
-        chans = self.state.to_channels(self.settings)
-        labels = self._channel_labels()
-        cols = 4
-        col_w = w // cols
-        row_h = 34
-        for i, label in enumerate(labels):
-            col = i % cols
-            row = i // cols
-            bx = x0 + col * col_w
-            by = y0 + row * row_h
-            self.screen.blit(self.font_small.render(label, True, COL_TEXT_DIM), (bx, by))
-            bar_x = bx + 78
-            bar_w = col_w - 130
-            bar_h = 12
-            bar_y = by + 2
-            pygame.draw.rect(self.screen, COL_BAR_BG, (bar_x, bar_y, bar_w, bar_h), border_radius=3)
-            frac = (chans[i] - 1000) / 1000.0
-            pygame.draw.rect(
-                self.screen,
-                COL_BAR_FILL,
-                (bar_x, bar_y, int(bar_w * _clamp(frac, 0, 1)), bar_h),
-                border_radius=3,
-            )
-            self.screen.blit(
-                self.font_small.render(str(chans[i]), True, COL_TEXT),
-                (bar_x + bar_w + 6, by),
-            )
+    # ---- status / switches ----
+    def _draw_status_card(self, card: pygame.Rect) -> None:
+        self._panel(card, "Status")
+        inner_x = card.x + 16
+        inner_w = card.w - 32
 
-    def _draw_switches(self) -> None:
-        x0 = 20
-        y0 = 330
-        chips = [("ARM", self.state.armed, COL_BAD)]
+        armed = self.state.armed
+        banner = pygame.Rect(inner_x, card.y + 46, inner_w, 60)
+        if armed:
+            pygame.draw.rect(self.screen, COL_GOOD, banner, border_radius=9)
+            self._text("ARMED", self.font_arm, (10, 20, 15), (banner.centerx, banner.y + 14), align="center")
+        else:
+            pygame.draw.rect(self.screen, COL_PANEL_LIGHT, banner, border_radius=9)
+            pygame.draw.rect(self.screen, COL_BAD, banner, width=2, border_radius=9)
+            self._text("DISARMED", self.font_arm, COL_BAD, (banner.centerx, banner.y + 14), align="center")
+
+        # AUX toggle rows
+        ry = banner.bottom + 14
         for i, on in enumerate(self.state.aux):
-            chips.append((f"AUX{i+1}", on, COL_ACCENT))
-        cx = x0
-        for name, on, on_color in chips:
-            color = COL_GOOD if (name == "ARM" and on) else (on_color if on else COL_PANEL_LIGHT)
-            label = f"{name}: {'ON' if on else 'OFF'}"
-            surf = self.font_small.render(label, True, COL_TEXT if on else COL_TEXT_DIM)
-            pad = 10
-            rect = pygame.Rect(cx, y0, surf.get_width() + pad * 2, 26)
-            pygame.draw.rect(self.screen, color, rect, border_radius=6)
-            self.screen.blit(surf, (cx + pad, y0 + 5))
-            cx += rect.width + 10
+            row = pygame.Rect(inner_x, ry, inner_w, 34)
+            pygame.draw.rect(self.screen, COL_PANEL_LIGHT, row, border_radius=7)
+            self._text(f"AUX {i + 1}", self.font, COL_TEXT_DIM, (row.x + 12, row.y + 8))
+            pill = pygame.Rect(row.right - 66, row.y + 6, 54, 22)
+            pygame.draw.rect(self.screen, COL_AUX if on else COL_TRACK, pill, border_radius=11)
+            self._text("ON" if on else "OFF", self.font_small,
+                       COL_TEXT if on else COL_TEXT_FAINT, (pill.centerx, pill.y + 4), align="center")
+            ry += 40
+
+    # ---- channels ----
+    def _channel_meta(self):
+        fnmap = {
+            "A": ("Roll", COL_ACCENT, True),
+            "E": ("Pitch", COL_ACCENT, True),
+            "T": ("Thr", COL_THROTTLE, False),
+            "R": ("Yaw", COL_ACCENT, True),
+        }
+        meta = []
+        order = self.settings.channel_order
+        for i in range(NUM_PACKET_CHANNELS):
+            if i < 4:
+                letter = order[i] if i < len(order) else "?"
+                name, col, bip = fnmap.get(letter, ("?", COL_MUTED, True))
+                meta.append((name, col, bip, "axis"))
+            elif i == 4:
+                meta.append(("Arm", COL_GOOD, False, "arm"))
+            elif i in (5, 6, 7):
+                meta.append((f"Aux{i - 4}", COL_AUX, False, "aux"))
+            else:
+                meta.append(("", COL_MUTED, False, "other"))
+        return meta
+
+    def _draw_channels(self, card: pygame.Rect) -> None:
+        self._panel(card, "Channels")
+        chans = self.state.to_channels(self.settings)
+        meta = self._channel_meta()
+        count = self.settings.channel_count
+        self._text(f"{count} ACTIVE", self.font_h, COL_TEXT_FAINT, (card.right - 16, card.y + 13), align="right")
+
+        cols = 4
+        inner_x = card.x + 18
+        inner_w = card.w - 36
+        col_w = inner_w // cols
+        top = card.y + 48
+        row_h = 50
+        mid = self.settings.pwm_mid
+
+        for i in range(count):
+            name, col, bipolar, kind = meta[i]
+            val = chans[i]
+            row = i // cols
+            colx = inner_x + (i % cols) * col_w
+            cy = top + row * row_h
+
+            active = True
+            if kind == "arm":
+                active = self.state.armed
+            elif kind == "aux":
+                active = val >= mid
+            draw_col = col if active else COL_MUTED
+
+            label = f"CH{i + 1}"
+            self._text(label, self.font_mono_sm, COL_TEXT, (colx, cy))
+            if name:
+                lw = self.font_mono_sm.size(label + " ")[0]
+                self._text(name, self.font_small, COL_TEXT_DIM, (colx + lw + 4, cy + 1))
+
+            track_x = colx
+            track_w = col_w - 66
+            track_y = cy + 24
+            track_h = 6
+            pygame.draw.rect(self.screen, COL_TRACK, (track_x, track_y, track_w, track_h), border_radius=3)
+
+            frac = _clamp((val - 1000) / 1000.0, 0.0, 1.0)
+            if bipolar:
+                cx_track = track_x + track_w // 2
+                pos = track_x + int(frac * track_w)
+                fx = min(cx_track, pos)
+                fw = max(2, abs(pos - cx_track))
+                pygame.draw.rect(self.screen, draw_col, (fx, track_y, fw, track_h), border_radius=3)
+                pygame.draw.line(self.screen, COL_BORDER_HI,
+                                 (cx_track, track_y - 3), (cx_track, track_y + track_h + 3), 1)
+            else:
+                pygame.draw.rect(self.screen, draw_col,
+                                 (track_x, track_y, max(2, int(frac * track_w)), track_h), border_radius=3)
+
+            vcol = draw_col if kind in ("arm", "aux") else COL_TEXT
+            self._text(str(val), self.font_mono_sm, vcol, (colx + col_w - 12, cy + 12), align="right")
 
     def _draw_legend(self) -> None:
-        lines = [
-            "Left stick (W/S throttle, A/D yaw)   Right stick (Arrows pitch/roll)   Mouse: drag either stick",
-            "Enter: ARM/DISARM    1/2/3: AUX1-3    R: reset/failsafe    Tab: settings    Esc: quit",
+        items = [
+            ("W/S", "throttle"), ("A/D", "yaw"), ("Arrows", "pitch/roll"),
+            ("Drag", "sticks"), ("Enter", "arm"), ("1/2/3", "aux"),
+            ("R", "reset"), ("Tab", "settings"), ("Esc", "quit"),
         ]
-        y = WINDOW_H - 44
-        for line in lines:
-            self.screen.blit(self.font_small.render(line, True, COL_TEXT_DIM), (20, y))
-            y += 18
+        y = WINDOW_H - 30
+        x = 24
+        for key, desc in items:
+            kr = self.font_mono_sm.render(key, True, COL_ACCENT)
+            pad = 6
+            box = pygame.Rect(x, y, kr.get_width() + pad * 2, 20)
+            pygame.draw.rect(self.screen, COL_PANEL_LIGHT, box, border_radius=5)
+            pygame.draw.rect(self.screen, COL_BORDER, box, width=1, border_radius=5)
+            self.screen.blit(kr, (x + pad, y + 3))
+            x += box.width + 6
+            dr = self._text(desc, self.font_small, COL_TEXT_DIM, (x, y + 3))
+            x += dr.width + 20
 
     # ------------------------------------------------------------------
     def _draw_panel(self) -> None:
         overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
+        overlay.fill((0, 0, 0, 190))
         self.screen.blit(overlay, (0, 0))
 
-        pw, ph = 560, 560
+        pw, ph = 580, 588
         px = (WINDOW_W - pw) // 2
         py = (WINDOW_H - ph) // 2
-        pygame.draw.rect(self.screen, COL_PANEL, (px, py, pw, ph), border_radius=10)
-        pygame.draw.rect(self.screen, COL_ACCENT, (px, py, pw, ph), 2, border_radius=10)
+        pygame.draw.rect(self.screen, COL_PANEL, (px, py, pw, ph), border_radius=12)
+        pygame.draw.rect(self.screen, COL_BORDER_HI, (px, py, pw, ph), 1, border_radius=12)
+        pygame.draw.rect(self.screen, COL_ACCENT, (px, py, pw, 3), border_top_left_radius=12, border_top_right_radius=12)
 
-        title = self.font_big.render("Settings", True, COL_TEXT)
-        self.screen.blit(title, (px + 20, py + 14))
+        self._text("SETTINGS", self.font_title, COL_TEXT, (px + 20, py + 14))
         hint_lines = [
             "Up/Down select   Left/Right adjust (Shift=coarse)   Enter edit",
             "Ctrl+S save   D defaults   Tab/Esc close",
         ]
-        hy = py + 44
+        hy = py + 46
         for line in hint_lines:
             self.screen.blit(self.font_small.render(line, True, COL_TEXT_DIM), (px + 20, hy))
             hy += 16
 
-        y = py + 82
-        row_h = 21
+        y = py + 84
+        row_h = 22
         panel = self.panel
         for i, f in enumerate(panel.fields):
             if f.kind == "header":
-                self.screen.blit(self.font_small.render(f.label, True, COL_ACCENT), (px + 20, y + 3))
+                self.screen.blit(self.font_h.render(f.label, True, COL_ACCENT), (px + 20, y + 4))
                 y += row_h
                 continue
             selected = i == panel.selected
             if selected:
                 pygame.draw.rect(
-                    self.screen, COL_PANEL_LIGHT, (px + 12, y, pw - 24, row_h), border_radius=4
+                    self.screen, COL_PANEL_LIGHT, (px + 12, y, pw - 24, row_h), border_radius=5
                 )
             label_col = COL_TEXT if selected else COL_TEXT_DIM
-            self.screen.blit(self.font_small.render(f.label, True, label_col), (px + 28, y + 3))
+            self.screen.blit(self.font.render(f.label, True, label_col), (px + 28, y + 2))
 
             if panel.editing and selected:
                 value_str = panel.edit_buffer + "_"
                 val_col = COL_WARN
             else:
                 value_str = self._fmt_value(f)
-                val_col = COL_TEXT
-            vs = self.font_small.render(value_str, True, val_col)
-            self.screen.blit(vs, (px + pw - 30 - vs.get_width(), y + 3))
+                val_col = COL_ACCENT if selected else COL_TEXT
+            vs = self.font_mono.render(value_str, True, val_col)
+            self.screen.blit(vs, (px + pw - 30 - vs.get_width(), y + 2))
             y += row_h
 
         if panel.status and time.time() - panel.status_time < 3.0:
+            pygame.draw.line(self.screen, COL_BORDER, (px + 16, py + ph - 34), (px + pw - 16, py + ph - 34), 1)
             self.screen.blit(
-                self.font_small.render(panel.status, True, COL_GOOD), (px + 20, py + ph - 26)
+                self.font.render(panel.status, True, COL_GOOD), (px + 20, py + ph - 26)
             )
 
     def _fmt_value(self, f: Field) -> str:
@@ -830,6 +995,39 @@ class App:
 
 def _dist(a, b) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _pct(x: float) -> str:
+    """Format a [-1, 1] axis as a signed percentage."""
+    v = round(_clamp(x, -1, 1) * 100)
+    return f"{v:+d}%"
+
+
+def _sysfont(names, size: int, bold: bool = False):
+    """Pick the first available system font from `names`, falling back safely."""
+    return pygame.font.SysFont(",".join(names), size, bold=bold)
+
+
+def _make_gradient(w: int, h: int, top, bottom) -> pygame.Surface:
+    surf = pygame.Surface((w, h))
+    for y in range(h):
+        t = y / max(1, h - 1)
+        color = (
+            round(top[0] + (bottom[0] - top[0]) * t),
+            round(top[1] + (bottom[1] - top[1]) * t),
+            round(top[2] + (bottom[2] - top[2]) * t),
+        )
+        pygame.draw.line(surf, color, (0, y), (w, y))
+    return surf
+
+
+def _fill_circle(surface, x, y, r, color) -> None:
+    """Anti-aliased filled circle."""
+    x, y, r = int(x), int(y), int(r)
+    if r <= 0:
+        return
+    gfxdraw.filled_circle(surface, x, y, r, color)
+    gfxdraw.aacircle(surface, x, y, r, color)
 
 
 def _normalize_in_circle(pos, center, r) -> tuple:
