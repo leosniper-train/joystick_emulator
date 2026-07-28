@@ -14,6 +14,8 @@ ENV/
 build/
 dist/
 .eggs/
+*.spec.bak
+JoystickEmulator.exe
 
 # IDE / editor
 .vscode/

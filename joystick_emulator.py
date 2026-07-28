@@ -2127,6 +2127,13 @@ def _normalize_in_circle(pos, center, r) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+def app_dir() -> str:
+    """Directory for config.json: next to the .exe when frozen, else script dir."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def parse_args(argv) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Betaflight joystick emulator (SITL / DEVICE)")
     p.add_argument("--mode", choices=list(MODES), help="sitl (UDP) or device (MSP over WebSocket)")
@@ -2136,7 +2143,7 @@ def parse_args(argv) -> argparse.Namespace:
     p.add_argument("--msp-url", help="DEVICE MSP WebSocket URL (default ws://127.0.0.1:5761)")
     p.add_argument(
         "--config",
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME),
+        default=os.path.join(app_dir(), CONFIG_FILENAME),
         help="path to config.json",
     )
     return p.parse_args(argv)

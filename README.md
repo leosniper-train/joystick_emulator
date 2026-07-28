@@ -92,6 +92,27 @@ py -m pip install -r requirements.txt
 python joystick_emulator.py
 ```
 
+## Build Windows .exe
+
+To ship a standalone app that runs on any Windows PC **without Python**:
+
+```bash
+build.bat
+```
+
+Or manually:
+
+```bash
+py -m pip install -r requirements.txt -r requirements-build.txt
+py -m PyInstaller --noconfirm --clean joystick_emulator.spec
+```
+
+Output: `dist\JoystickEmulator.exe` (single file, no console window).
+
+Copy that `.exe` anywhere and double-click. On first run it creates `config.json`
+next to the exe. Antivirus may scan a freshly built unsigned exe once — that is
+normal for PyInstaller packages.
+
 DEVICE mode against the default bridge:
 
 ```bash
