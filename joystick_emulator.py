@@ -1,12 +1,10 @@
-"""Betaflight SITL Joystick Emulator.
+"""Betaflight Joystick Emulator (SITL + DEVICE).
 
-A virtual RC transmitter that sends RC channel packets to a Betaflight SITL
-instance over UDP. Controllable with both mouse (drag the on-screen sticks) and
-keyboard (WASD + arrow keys + mode keys).
+Virtual RC transmitter for Betaflight:
+  - SITL mode: UDP RC to port 9004, PWM feedback on port 9001
+  - DEVICE mode: MSP over a WebSocket serial bridge (default ws://127.0.0.1:5761)
 
-Protocol (Betaflight SITL, UDP RC input on port 9004):
-    struct { double timestamp; uint16_t channels[16]; }  little-endian
-Channels use the 1000-2000 PWM range with AETR mapping by default.
+Controllable with mouse (drag sticks) and keyboard (WASD + arrows + AUX keys).
 """
 
 from __future__ import annotations
@@ -22,9 +20,15 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 import pygame
 from pygame import gfxdraw
+
+try:
+    import websocket
+except ImportError:  # pragma: no cover - installed via requirements.txt
+    websocket = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,6 +38,13 @@ CONFIG_FILENAME = "config.json"
 NUM_PACKET_CHANNELS = 16  # Betaflight SITL always reads a fixed 16-channel struct.
 NUM_AUX_CHANNELS = 12     # CH5..CH16 are user-configurable AUX channels.
 AUX_TYPES = ("2pos", "3pos", "slider")
+MODES = ("sitl", "device")
+
+# MSP v1 command IDs (Betaflight)
+MSP_SERVO = 103
+MSP_MOTOR = 104
+MSP_STATUS_EX = 150
+MSP_SET_RAW_RC = 200
 
 WINDOW_W, WINDOW_H = 880, 648
 FPS_RENDER_CAP = 120  # Rendering may run faster than the RC send rate.
@@ -83,6 +94,7 @@ class Settings:
     """All user-tunable parameters. Persisted to config.json."""
 
     # Core
+    mode: str = "sitl"             # "sitl" | "device"
     ip: str = "127.0.0.1"
     port: int = 9004
     send_hz: int = 50
@@ -93,6 +105,11 @@ class Settings:
 
     # Only transmit RC while the SITL's PWM output is being received.
     require_pwm: bool = True
+
+    # DEVICE mode: MSP over WebSocket serial bridge
+    msp_ws_url: str = "ws://127.0.0.1:5761"
+    msp_poll_hz: int = 20
+    require_msp: bool = True
 
     # PWM range
     pwm_min: int = 1000
@@ -118,11 +135,25 @@ class Settings:
     aux_types: list = field(default_factory=lambda: ["2pos"] * NUM_AUX_CHANNELS)
 
     # ------------------------------------------------------------------
+    @property
+    def is_device(self) -> bool:
+        return self.mode == "device"
+
+    # ------------------------------------------------------------------
     def clamp_all(self) -> None:
         """Validate/clamp values into sane ranges."""
+        mode = str(self.mode).strip().lower()
+        self.mode = mode if mode in MODES else "sitl"
         self.port = int(_clamp(self.port, 1, 65535))
         self.pwm_in_port = int(_clamp(self.pwm_in_port, 1, 65535))
         self.send_hz = int(_clamp(self.send_hz, 1, 250))
+        self.msp_poll_hz = int(_clamp(self.msp_poll_hz, 1, 100))
+        url = str(self.msp_ws_url).strip()
+        if not url:
+            url = "ws://127.0.0.1:5761"
+        if "://" not in url:
+            url = "ws://" + url
+        self.msp_ws_url = url
         self.pwm_min = int(_clamp(self.pwm_min, 500, 2500))
         self.pwm_max = int(_clamp(self.pwm_max, 500, 2500))
         if self.pwm_max < self.pwm_min:
@@ -524,8 +555,333 @@ class PWMReceiver:
 
 
 # ---------------------------------------------------------------------------
-# Settings panel
+# MSP over WebSocket (DEVICE mode)
 # ---------------------------------------------------------------------------
+
+
+class MspCodec:
+    """MSP v1 encode / stream decode (`$M<` request, `$M>` / `$M!` reply)."""
+
+    @staticmethod
+    def encode_request(cmd: int, payload: bytes = b"") -> bytes:
+        if len(payload) > 255:
+            raise ValueError("MSP v1 payload must be <= 255 bytes")
+        size = len(payload)
+        checksum = size ^ (cmd & 0xFF)
+        for b in payload:
+            checksum ^= b
+        return b"$M<" + bytes([size, cmd & 0xFF]) + payload + bytes([checksum & 0xFF])
+
+
+class MspDecoder:
+    """Incremental MSP v1 frame decoder for a byte stream."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def reset(self) -> None:
+        self._buf.clear()
+
+    def feed(self, data: bytes) -> list:
+        """Return list of (cmd, payload, ok) where ok=False means error reply (`$M!`)."""
+        if not data:
+            return []
+        self._buf.extend(data)
+        out = []
+        while True:
+            parsed = self._try_one()
+            if parsed is None:
+                break
+            out.append(parsed)
+        return out
+
+    def _try_one(self):
+        buf = self._buf
+        # Scan for `$M`
+        while True:
+            idx = buf.find(b"$M")
+            if idx < 0:
+                # Keep last byte in case of a split `$`
+                if buf and buf[-1] == ord("$"):
+                    del buf[:-1]
+                else:
+                    buf.clear()
+                return None
+            if idx > 0:
+                del buf[:idx]
+            if len(buf) < 3:
+                return None
+            direction = buf[2]
+            if direction not in (ord("<"), ord(">"), ord("!")):
+                del buf[0]
+                continue
+            if len(buf) < 5:
+                return None
+            size = buf[3]
+            cmd = buf[4]
+            total = 5 + size + 1
+            if len(buf) < total:
+                return None
+            payload = bytes(buf[5:5 + size])
+            checksum = buf[5 + size]
+            expect = size ^ cmd
+            for b in payload:
+                expect ^= b
+            del buf[:total]
+            if (expect & 0xFF) != checksum:
+                continue
+            return cmd, payload, direction != ord("!")
+
+
+class MspSnapshot:
+    """Immutable view of the DEVICE MSP link, safe to read on the main thread."""
+
+    __slots__ = (
+        "enabled", "connected", "error", "motors", "servos", "motor_count",
+        "armed", "cycle_time", "cpu_load", "last_rx", "packets", "rc_sent",
+    )
+
+    def __init__(
+        self, enabled, connected, error, motors, servos, motor_count,
+        armed, cycle_time, cpu_load, last_rx, packets, rc_sent,
+    ):
+        self.enabled = enabled
+        self.connected = connected
+        self.error = error
+        self.motors = motors
+        self.servos = servos
+        self.motor_count = motor_count
+        self.armed = armed
+        self.cycle_time = cycle_time
+        self.cpu_load = cpu_load
+        self.last_rx = last_rx
+        self.packets = packets
+        self.rc_sent = rc_sent
+
+    def alive(self, timeout: float) -> bool:
+        return self.connected and (time.time() - self.last_rx) < timeout
+
+
+class MspDeviceLink:
+    """WebSocket MSP client: SET_RAW_RC + MOTOR/SERVO/STATUS_EX polling."""
+
+    RX_TIMEOUT = 1.5
+    _RECONNECT_DELAY = 1.0
+
+    def __init__(self, url: str, enabled: bool = True, poll_hz: int = 20) -> None:
+        self.url = url
+        self.enabled = enabled
+        self.poll_hz = max(1, int(poll_hz))
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ws = None
+        self._decoder = MspDecoder()
+
+        self._connected = False
+        self._error: Optional[str] = None
+        self._motors = [0.0] * 16
+        self._servos = [0.0] * 16
+        self._motor_count = 0
+        self._armed = False
+        self._cycle_time = 0
+        self._cpu_load = 0
+        self._last_rx = 0.0
+        self._packets = 0
+        self._rc_sent = 0
+        self._pending_rc: Optional[bytes] = None
+
+        if enabled:
+            self._start()
+
+    def _start(self) -> None:
+        if websocket is None:
+            with self._lock:
+                self._error = "websocket-client not installed"
+                self._connected = False
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="msp-ws", daemon=True)
+        self._thread.start()
+
+    def _stop_thread(self) -> None:
+        self._stop.set()
+        ws = self._ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._thread = None
+        self._ws = None
+        with self._lock:
+            self._connected = False
+
+    def reconfigure(self, url: str, enabled: bool, poll_hz: int) -> None:
+        url = url.strip()
+        poll_hz = max(1, int(poll_hz))
+        if url == self.url and enabled == self.enabled and poll_hz == self.poll_hz:
+            return
+        self._stop_thread()
+        self.url = url
+        self.enabled = enabled
+        self.poll_hz = poll_hz
+        self._decoder.reset()
+        if enabled:
+            self._start()
+
+    def send_rc(self, channels: list) -> None:
+        """Queue an MSP_SET_RAW_RC frame (sent by the worker thread)."""
+        n = max(4, min(len(channels), NUM_PACKET_CHANNELS))
+        chans = [int(_clamp(c, 1000, 2000)) for c in channels[:n]]
+        if len(chans) < n:
+            chans += [1500] * (n - len(chans))
+        payload = struct.pack("<%dH" % n, *chans)
+        frame = MspCodec.encode_request(MSP_SET_RAW_RC, payload)
+        with self._lock:
+            self._pending_rc = frame
+
+    def snapshot(self) -> MspSnapshot:
+        with self._lock:
+            return MspSnapshot(
+                self.enabled,
+                self._connected,
+                self._error,
+                list(self._motors),
+                list(self._servos),
+                self._motor_count,
+                self._armed,
+                self._cycle_time,
+                self._cpu_load,
+                self._last_rx,
+                self._packets,
+                self._rc_sent,
+            )
+
+    def close(self) -> None:
+        self._stop_thread()
+
+    # ---- worker ----
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ws = websocket.create_connection(
+                    self.url,
+                    timeout=3,
+                    enable_multithread=True,
+                    # Serial bridges (incl. the local :5761 server) require this.
+                    subprotocols=["binary"],
+                )
+                ws.settimeout(0.05)
+            except Exception as exc:
+                with self._lock:
+                    self._connected = False
+                    self._error = str(exc)
+                    self._ws = None
+                self._stop.wait(self._RECONNECT_DELAY)
+                continue
+
+            self._decoder.reset()
+            with self._lock:
+                self._ws = ws
+                self._connected = True
+                self._error = None
+
+            last_poll = 0.0
+            try:
+                while not self._stop.is_set():
+                    # Flush pending RC
+                    with self._lock:
+                        frame = self._pending_rc
+                        self._pending_rc = None
+                    if frame is not None:
+                        try:
+                            ws.send_binary(frame)
+                            with self._lock:
+                                self._rc_sent += 1
+                        except Exception as exc:
+                            with self._lock:
+                                self._error = str(exc)
+                            break
+
+                    now = time.time()
+                    interval = 1.0 / self.poll_hz
+                    if now - last_poll >= interval:
+                        last_poll = now
+                        for cmd in (MSP_MOTOR, MSP_SERVO, MSP_STATUS_EX):
+                            try:
+                                ws.send_binary(MspCodec.encode_request(cmd))
+                            except Exception as exc:
+                                with self._lock:
+                                    self._error = str(exc)
+                                break
+                        else:
+                            pass
+
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except Exception as exc:
+                        with self._lock:
+                            self._error = str(exc)
+                        break
+
+                    if raw is None:
+                        break
+                    if isinstance(raw, str):
+                        data = raw.encode("latin-1", errors="ignore")
+                    else:
+                        data = bytes(raw)
+                    for cmd, payload, ok in self._decoder.feed(data):
+                        if ok:
+                            self._handle_reply(cmd, payload)
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._ws is ws:
+                        self._ws = None
+                    self._connected = False
+            if not self._stop.is_set():
+                self._stop.wait(self._RECONNECT_DELAY)
+
+    def _handle_reply(self, cmd: int, payload: bytes) -> None:
+        with self._lock:
+            self._last_rx = time.time()
+            self._packets += 1
+            if cmd == MSP_MOTOR:
+                n = len(payload) // 2
+                vals = list(struct.unpack("<%dH" % n, payload[: n * 2])) if n else []
+                motors = [0.0] * 16
+                for i, v in enumerate(vals[:16]):
+                    motors[i] = float(v)
+                self._motors = motors
+                # Count active motors (non-zero or any reported slot)
+                self._motor_count = max(1, min(len(vals), 16)) if vals else 4
+            elif cmd == MSP_SERVO:
+                n = len(payload) // 2
+                vals = list(struct.unpack("<%dH" % n, payload[: n * 2])) if n else []
+                servos = [0.0] * 16
+                for i, v in enumerate(vals[:16]):
+                    servos[i] = float(v)
+                self._servos = servos
+            elif cmd == MSP_STATUS_EX and len(payload) >= 11:
+                # cycleTime u16, i2cError u16, sensor u16, flightModeFlags u32, ...
+                cycle_time, _i2c, _sensor = struct.unpack_from("<HHH", payload, 0)
+                flags = struct.unpack_from("<I", payload, 6)[0]
+                cpu_load = 0
+                if len(payload) >= 13:
+                    cpu_load = struct.unpack_from("<H", payload, 11)[0]
+                self._cycle_time = int(cycle_time)
+                self._cpu_load = int(cpu_load)
+                self._armed = bool(flags & 0x1)
 
 
 class Field:
@@ -541,30 +897,45 @@ class Field:
         vmin: float = 0.0,
         vmax: float = 0.0,
         fmt: Optional[Callable[[Any], str]] = None,
+        choices: Optional[tuple] = None,
     ) -> None:
         self.label = label
         self.attr = attr          # None => section header (not selectable)
-        self.kind = kind          # "int" | "float" | "bool" | "str" | "header"
+        self.kind = kind          # "int" | "float" | "bool" | "str" | "choice" | "header"
         self.step = step
         self.big_step = big_step
         self.vmin = vmin
         self.vmax = vmax
         self.fmt = fmt
+        self.choices = tuple(choices) if choices else ()
 
     @property
     def selectable(self) -> bool:
         return self.attr is not None and self.kind != "header"
 
 
-def build_fields() -> list:
-    return [
+def build_fields(mode: str = "sitl") -> list:
+    mode = mode if mode in MODES else "sitl"
+    rows = [
         Field("CORE", None, "header"),
-        Field("Target IP", "ip", "str"),
-        Field("RC out port", "port", "int", 1, 10, 1, 65535),
+        Field("Mode", "mode", "choice", choices=MODES),
         Field("Send rate (Hz)", "send_hz", "int", 1, 10, 1, 250),
-        Field("PWM in port", "pwm_in_port", "int", 1, 10, 1, 65535),
-        Field("PWM in enabled", "pwm_in_enabled", "bool"),
-        Field("Require PWM link", "require_pwm", "bool"),
+    ]
+    if mode == "sitl":
+        rows += [
+            Field("Target IP", "ip", "str"),
+            Field("RC out port", "port", "int", 1, 10, 1, 65535),
+            Field("PWM in port", "pwm_in_port", "int", 1, 10, 1, 65535),
+            Field("PWM in enabled", "pwm_in_enabled", "bool"),
+            Field("Require PWM link", "require_pwm", "bool"),
+        ]
+    else:
+        rows += [
+            Field("MSP WebSocket URL", "msp_ws_url", "str"),
+            Field("MSP poll (Hz)", "msp_poll_hz", "int", 1, 5, 1, 100),
+            Field("Require MSP link", "require_msp", "bool"),
+        ]
+    rows += [
         Field("PWM RANGE", None, "header"),
         Field("PWM min", "pwm_min", "int", 5, 50, 500, 2500),
         Field("PWM mid", "pwm_mid", "int", 5, 50, 500, 2500),
@@ -583,6 +954,7 @@ def build_fields() -> list:
         Field("AUX low PWM", "aux_low", "int", 5, 50, 500, 2500),
         Field("AUX high PWM", "aux_high", "int", 5, 50, 500, 2500),
     ]
+    return rows
 
 
 class SettingsPanel:
@@ -591,13 +963,26 @@ class SettingsPanel:
     def __init__(self, settings: Settings, config_path: str) -> None:
         self.settings = settings
         self.config_path = config_path
-        self.fields = build_fields()
+        self.fields = build_fields(settings.mode)
         self.selected = self._first_selectable()
         self.editing = False
         self.edit_buffer = ""
         self.status = ""
         self.status_time = 0.0
         self.on_change: Optional[Callable[[], None]] = None
+
+    def refresh_fields(self) -> None:
+        """Rebuild rows when mode changes; keep selection on Mode if possible."""
+        prev_attr = None
+        if 0 <= self.selected < len(self.fields):
+            prev_attr = self.fields[self.selected].attr
+        self.fields = build_fields(self.settings.mode)
+        if prev_attr:
+            for i, f in enumerate(self.fields):
+                if f.attr == prev_attr:
+                    self.selected = i
+                    return
+        self.selected = self._first_selectable()
 
     def _first_selectable(self) -> int:
         for i, f in enumerate(self.fields):
@@ -627,12 +1012,25 @@ class SettingsPanel:
             setattr(s, field_obj.attr, round(float(cur) + amount, 4))
         elif field_obj.kind == "bool":
             setattr(s, field_obj.attr, not cur)
+        elif field_obj.kind == "choice" and field_obj.choices:
+            choices = field_obj.choices
+            try:
+                idx = choices.index(cur)
+            except ValueError:
+                idx = 0
+            idx = (idx + (1 if amount >= 0 else -1)) % len(choices)
+            setattr(s, field_obj.attr, choices[idx])
         else:
             return
         self._apply()
 
     def _apply(self) -> None:
         self.settings.clamp_all()
+        # Rebuild CORE rows when mode flips between sitl / device.
+        new_attrs = [f.attr for f in build_fields(self.settings.mode)]
+        old_attrs = [f.attr for f in self.fields]
+        if new_attrs != old_attrs:
+            self.refresh_fields()
         if self.on_change:
             self.on_change()
 
@@ -643,7 +1041,7 @@ class SettingsPanel:
                 setattr(self.settings, field_obj.attr, int(float(raw)))
             elif field_obj.kind == "float":
                 setattr(self.settings, field_obj.attr, float(raw))
-            elif field_obj.kind == "str":
+            elif field_obj.kind in ("str", "choice"):
                 setattr(self.settings, field_obj.attr, raw)
             self._apply()
             self._set_status(f"Set {field_obj.label}")
@@ -693,6 +1091,8 @@ class SettingsPanel:
         elif event.key == pygame.K_RETURN:
             if field_obj.kind == "bool":
                 self._adjust(field_obj, 0)
+            elif field_obj.kind == "choice":
+                self._adjust(field_obj, 1)
             else:
                 self.editing = True
                 self.edit_buffer = str(getattr(self.settings, field_obj.attr))
@@ -707,6 +1107,7 @@ class SettingsPanel:
         defaults = Settings()
         for f in fields(Settings):
             setattr(self.settings, f.name, getattr(defaults, f.name))
+        self.refresh_fields()
         self._apply()
         self._set_status("Reset to defaults")
 
@@ -723,19 +1124,28 @@ class App:
         self.state = RCState()
         self.state.reset(settings)
         self.sender = RCSender(settings.ip, settings.port)
-        self.pwm_in = PWMReceiver(settings.pwm_in_port, settings.pwm_in_enabled)
+        # Only bind the SITL PWM port when actually in SITL mode.
+        self.pwm_in = PWMReceiver(
+            settings.pwm_in_port,
+            settings.pwm_in_enabled and not settings.is_device,
+        )
+        self.msp = MspDeviceLink(
+            settings.msp_ws_url,
+            enabled=settings.is_device,
+            poll_hz=settings.msp_poll_hz,
+        )
 
         self.panel = SettingsPanel(settings, config_path)
         self.panel.on_change = self._on_settings_changed
         self.panel_open = False
 
         self.running = True
-        self.dragging: Optional[str] = None  # "left" | "right" | None
+        self.dragging: Optional[str] = None  # "left" | "right" | ("aux", idx) | None
         self._send_accumulator = 0.0
         self.rc_active = False  # True while actually transmitting RC
 
         pygame.init()
-        pygame.display.set_caption("Betaflight SITL Joystick Emulator")
+        pygame.display.set_caption("Betaflight Joystick Emulator")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.clock = pygame.time.Clock()
 
@@ -780,7 +1190,16 @@ class App:
     # ------------------------------------------------------------------
     def _on_settings_changed(self) -> None:
         self.sender.retarget(self.settings.ip, self.settings.port)
-        self.pwm_in.reconfigure(self.settings.pwm_in_port, self.settings.pwm_in_enabled)
+        sitl = not self.settings.is_device
+        self.pwm_in.reconfigure(
+            self.settings.pwm_in_port,
+            self.settings.pwm_in_enabled and sitl,
+        )
+        self.msp.reconfigure(
+            self.settings.msp_ws_url,
+            enabled=self.settings.is_device,
+            poll_hz=self.settings.msp_poll_hz,
+        )
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -796,6 +1215,7 @@ class App:
     def _shutdown(self) -> None:
         self.sender.close()
         self.pwm_in.close()
+        self.msp.close()
         pygame.quit()
 
     # ------------------------------------------------------------------
@@ -966,22 +1386,38 @@ class App:
     # Sending
     # ------------------------------------------------------------------
     def _maybe_send(self, dt: float) -> None:
-        # "Intelligent" gating: only transmit RC while the SITL's PWM output is
-        # being received. Skip the gate if PWM input is disabled (nothing to
-        # gate on) or the user turned the requirement off.
+        channels = self.state.to_channels(self.settings)
+
+        if self.settings.is_device:
+            gate = self.settings.require_msp
+            msp = self.msp.snapshot()
+            if gate and not msp.alive(MspDeviceLink.RX_TIMEOUT):
+                self.rc_active = False
+                self._send_accumulator = 0.0
+                return
+            self.rc_active = True
+            interval = 1.0 / max(1, self.settings.send_hz)
+            self._send_accumulator += dt
+            sent = 0
+            while self._send_accumulator >= interval and sent < 5:
+                self.msp.send_rc(channels)
+                self._send_accumulator -= interval
+                sent += 1
+            return
+
+        # SITL: gate on PWM link when required.
         gate = self.settings.require_pwm and self.settings.pwm_in_enabled
         if gate and not self.pwm_in.snapshot().connected(PWMReceiver.RX_TIMEOUT):
             self.rc_active = False
-            self._send_accumulator = 0.0  # avoid a burst when the link returns
+            self._send_accumulator = 0.0
             return
 
         self.rc_active = True
         interval = 1.0 / max(1, self.settings.send_hz)
         self._send_accumulator += dt
-        # Send at most a few packets per frame to catch up without flooding.
         sent = 0
         while self._send_accumulator >= interval and sent < 5:
-            self.sender.send(self.state.to_channels(self.settings))
+            self.sender.send(channels)
             self._send_accumulator -= interval
             sent += 1
 
@@ -1026,22 +1462,43 @@ class App:
         pygame.draw.rect(self.screen, COL_PANEL, bar)
         pygame.draw.line(self.screen, COL_BORDER_HI, (0, 48), (WINDOW_W, 48), 1)
         pygame.draw.rect(self.screen, COL_ACCENT, (0, 0, 4, 48))
-        self._text("BETAFLIGHT SITL", self.font_title, COL_TEXT, (14, 6))
+        mode_label = "DEVICE" if self.settings.is_device else "SITL"
+        self._text(f"BETAFLIGHT {mode_label}", self.font_title, COL_TEXT, (14, 6))
         self._text("JOYSTICK EMULATOR", self.font_h, COL_ACCENT, (16, 29))
 
-        if self.sender.last_error is not None:
-            status, dot_col = "SEND ERROR", COL_BAD
-        elif self.rc_active:
-            status, dot_col = "SENDING", COL_GOOD
-        elif self.settings.require_pwm and self.settings.pwm_in_enabled:
-            status, dot_col = "STANDBY (no PWM)", COL_WARN
+        if self.settings.is_device:
+            msp = self.msp.snapshot()
+            if msp.error and not msp.connected:
+                status, dot_col = "WS ERROR", COL_BAD
+            elif self.rc_active:
+                status, dot_col = "SENDING", COL_GOOD
+            elif self.settings.require_msp:
+                status, dot_col = "STANDBY (no MSP)", COL_WARN
+            else:
+                status, dot_col = "IDLE", COL_TEXT_DIM
+            try:
+                host = urlparse(self.settings.msp_ws_url).netloc or self.settings.msp_ws_url
+            except Exception:
+                host = self.settings.msp_ws_url
+            endpoint = host
+            pkts = f"{msp.rc_sent:,} rc"
         else:
-            status, dot_col = "IDLE", COL_TEXT_DIM
+            if self.sender.last_error is not None:
+                status, dot_col = "SEND ERROR", COL_BAD
+            elif self.rc_active:
+                status, dot_col = "SENDING", COL_GOOD
+            elif self.settings.require_pwm and self.settings.pwm_in_enabled:
+                status, dot_col = "STANDBY (no PWM)", COL_WARN
+            else:
+                status, dot_col = "IDLE", COL_TEXT_DIM
+            endpoint = f"{self.settings.ip}:{self.settings.port}"
+            pkts = f"{self.sender.packets_sent:,} pkts"
+
         segments = [
             (status, dot_col, True),
-            (f"{self.settings.ip}:{self.settings.port}", COL_TEXT, False),
+            (endpoint, COL_TEXT, False),
             (f"{self.settings.send_hz} Hz", COL_TEXT_DIM, False),
-            (f"{self.sender.packets_sent:,} pkts", COL_TEXT_DIM, False),
+            (pkts, COL_TEXT_DIM, False),
         ]
         x = WINDOW_W - 14
         rev = list(reversed(segments))
@@ -1113,6 +1570,13 @@ class App:
         inner_w = card.w - 28
 
         armed = self.state.armed
+        fc_note = "CH5"
+        if self.settings.is_device:
+            msp = self.msp.snapshot()
+            if msp.alive(MspDeviceLink.RX_TIMEOUT):
+                armed = msp.armed
+                fc_note = "FC"
+
         banner = pygame.Rect(inner_x, card.y + 44, inner_w, 50)
         if armed:
             pygame.draw.rect(self.screen, COL_GOOD, banner, border_radius=9)
@@ -1122,20 +1586,32 @@ class App:
             pygame.draw.rect(self.screen, COL_BAD, banner, width=2, border_radius=9)
             self._text("DISARMED", self.font_arm, COL_BAD, (banner.centerx, banner.y + 12), align="center")
 
-        # AUX control help. CH5..CH16 are actuated directly in the Channels panel.
-        hints = [
-            ("CH5-16", "AUX switches"),
-            ("Left-click", "actuate / cycle"),
-            ("Right-click", "change type"),
-            ("Enter / 1-0", "CH5 / CH6-15"),
-        ]
-        hy = banner.bottom + 14
-        for key, desc in hints:
-            self._text(key, self.font_h, COL_ACCENT, (inner_x + 2, hy))
-            self._text(desc, self.font_small, COL_TEXT_DIM, (inner_x + 88, hy))
-            hy += 18
-        self._text("2P 2-pos   3P 3-pos   SL slider", self.font_small,
-                   COL_TEXT_FAINT, (inner_x + 2, hy + 4))
+        if self.settings.is_device:
+            msp = self.msp.snapshot()
+            hy = banner.bottom + 10
+            link = "MSP LINK" if msp.alive(MspDeviceLink.RX_TIMEOUT) else "MSP WAIT"
+            lcol = COL_GOOD if msp.alive(MspDeviceLink.RX_TIMEOUT) else COL_WARN
+            self._text(link, self.font_h, lcol, (inner_x + 2, hy))
+            self._text(f"load {msp.cpu_load}%  {msp.cycle_time}us", self.font_small,
+                       COL_TEXT_DIM, (inner_x + 2, hy + 16))
+            self._text(f"arm src: {fc_note}   CH5 still overrides", self.font_small,
+                       COL_TEXT_FAINT, (inner_x + 2, hy + 34))
+            self._text("Enter arm   Click AUX CH5-16", self.font_small,
+                       COL_TEXT_DIM, (inner_x + 2, hy + 52))
+        else:
+            hints = [
+                ("CH5-16", "AUX switches"),
+                ("Left-click", "actuate / cycle"),
+                ("Right-click", "change type"),
+                ("Enter / 1-0", "CH5 / CH6-15"),
+            ]
+            hy = banner.bottom + 14
+            for key, desc in hints:
+                self._text(key, self.font_h, COL_ACCENT, (inner_x + 2, hy))
+                self._text(desc, self.font_small, COL_TEXT_DIM, (inner_x + 88, hy))
+                hy += 18
+            self._text("2P 2-pos   3P 3-pos   SL slider", self.font_small,
+                       COL_TEXT_FAINT, (inner_x + 2, hy + 4))
 
     # ---- channels ----
     def _channel_layout(self):
@@ -1246,27 +1722,57 @@ class App:
             self._text(str(val), self.font_mono_sm, draw_col, (colx + col_w - 12, cy + 12), align="right")
 
     def _draw_motors_card(self, card: pygame.Rect) -> None:
-        self._panel(card, "Motor / PWM Output")
-        rx = self.pwm_in.snapshot()
+        title = "Motor / MSP Output" if self.settings.is_device else "Motor / PWM Output"
+        self._panel(card, title)
 
-        if not rx.enabled:
-            status, scol = "DISABLED", COL_TEXT_FAINT
-        elif rx.error:
-            status, scol = "BIND ERROR", COL_BAD
-        elif rx.connected(PWMReceiver.RX_TIMEOUT):
-            status, scol = "RECEIVING", COL_GOOD
+        if self.settings.is_device:
+            msp = self.msp.snapshot()
+            if not msp.enabled:
+                status, scol = "DISABLED", COL_TEXT_FAINT
+            elif msp.error and not msp.connected:
+                status, scol = "WS ERROR", COL_BAD
+            elif msp.alive(MspDeviceLink.RX_TIMEOUT):
+                status, scol = "RECEIVING", COL_GOOD
+            else:
+                status, scol = "WAITING", COL_WARN
+            header = f"MSP   {status}"
+            mc = msp.motor_count if msp.motor_count > 0 else 4
+            # Pack motors then any non-zero servos into the bar strip.
+            display = list(msp.motors[:mc])
+            extra = []
+            for v in msp.servos:
+                if len(display) + len(extra) >= 16:
+                    break
+                if v > 0:
+                    extra.append(v)
+            values_draw = display + extra
+            if not values_draw:
+                values_draw = [0.0] * max(4, mc)
+                mc = max(4, mc)
+            total = max(1, min(len(values_draw), 16))
+            motor_slots = min(mc, total)
         else:
-            status, scol = "WAITING", COL_WARN
-        header = f"IN :{self.settings.pwm_in_port}   {status}"
+            rx = self.pwm_in.snapshot()
+            if not rx.enabled:
+                status, scol = "DISABLED", COL_TEXT_FAINT
+            elif rx.error:
+                status, scol = "BIND ERROR", COL_BAD
+            elif rx.connected(PWMReceiver.RX_TIMEOUT):
+                status, scol = "RECEIVING", COL_GOOD
+            else:
+                status, scol = "WAITING", COL_WARN
+            header = f"IN :{self.settings.pwm_in_port}   {status}"
+            mc = rx.motor_count if rx.motor_count > 0 else 4
+            total = mc
+            for i in range(mc, 16):
+                if rx.values[i] > 0:
+                    total = i + 1
+            total = max(1, min(total, 16))
+            values_draw = rx.values
+            motor_slots = mc
+
         hx = self._text(header, self.font_h, scol, (card.right - 16, card.y + 13), align="right").x
         _fill_circle(self.screen, hx - 10, card.y + 18, 4, scol)
-
-        mc = rx.motor_count if rx.motor_count > 0 else 4
-        total = mc
-        for i in range(mc, 16):
-            if rx.values[i] > 0:
-                total = i + 1
-        total = max(1, min(total, 16))
 
         area_top = card.y + 42
         area_bottom = card.bottom - 30
@@ -1277,8 +1783,8 @@ class App:
 
         for i in range(total):
             cx = base_x + slot * i + slot / 2
-            is_motor = i < mc
-            v = rx.values[i]
+            is_motor = i < motor_slots
+            v = values_draw[i] if i < len(values_draw) else 0.0
             frac = _clamp((v - 1000) / 1000.0, 0.0, 1.0)
             bx = int(cx - bar_w / 2)
             pygame.draw.rect(self.screen, COL_TRACK, (bx, area_top, bar_w, bar_h), border_radius=4)
@@ -1286,11 +1792,10 @@ class App:
             if fh > 0:
                 fill_col = COL_ACCENT if is_motor else COL_AUX
                 pygame.draw.rect(self.screen, fill_col, (bx, area_top + bar_h - fh, bar_w, fh), border_radius=4)
-            # mid reference tick
             midy = area_top + bar_h // 2
             pygame.draw.line(self.screen, COL_BORDER_HI, (bx, midy), (bx + bar_w, midy), 1)
 
-            label = f"M{i + 1}" if is_motor else f"S{i - mc + 1}"
+            label = f"M{i + 1}" if is_motor else f"S{i - motor_slots + 1}"
             self._text(label, self.font_small, COL_TEXT_DIM, (cx, card.bottom - 27), align="center")
             vtxt = str(int(round(v))) if v > 0 else "----"
             vcol = COL_TEXT if v > 0 else COL_TEXT_FAINT
@@ -1376,6 +1881,8 @@ class App:
             return "ON" if val else "OFF"
         if f.kind == "float":
             return f"{val:.3g}"
+        if f.kind == "choice":
+            return str(val).upper()
         return str(val)
 
 
@@ -1437,10 +1944,12 @@ def _normalize_in_circle(pos, center, r) -> tuple:
 
 
 def parse_args(argv) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Betaflight SITL joystick emulator")
-    p.add_argument("--ip", help="target IP for SITL RC input (overrides config)")
-    p.add_argument("--port", type=int, help="target UDP port (default 9004)")
+    p = argparse.ArgumentParser(description="Betaflight joystick emulator (SITL / DEVICE)")
+    p.add_argument("--mode", choices=list(MODES), help="sitl (UDP) or device (MSP over WebSocket)")
+    p.add_argument("--ip", help="SITL target IP for RC input (overrides config)")
+    p.add_argument("--port", type=int, help="SITL target UDP port (default 9004)")
     p.add_argument("--hz", type=int, help="RC send rate in Hz")
+    p.add_argument("--msp-url", help="DEVICE MSP WebSocket URL (default ws://127.0.0.1:5761)")
     p.add_argument(
         "--config",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME),
@@ -1452,12 +1961,16 @@ def parse_args(argv) -> argparse.Namespace:
 def main(argv=None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     settings = Settings.load(args.config)
+    if args.mode:
+        settings.mode = args.mode
     if args.ip:
         settings.ip = args.ip
     if args.port:
         settings.port = args.port
     if args.hz:
         settings.send_hz = args.hz
+    if args.msp_url:
+        settings.msp_ws_url = args.msp_url
     settings.clamp_all()
 
     app = App(settings, args.config)

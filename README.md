@@ -1,18 +1,23 @@
-# Betaflight SITL Joystick Emulator
+# Betaflight Joystick Emulator
 
-A virtual RC transmitter for [Betaflight SITL](https://betaflight.com/docs/development/SITL).
-It sends RC channel packets to the SITL over UDP and can be flown with **mouse**
-(drag the on-screen sticks) or **keyboard** (WASD + arrow keys). It also **receives
-the SITL's motor / servo PWM output** on UDP port 9001 and visualizes it live. All
-parameters (target IP, send rate, PWM range, stick feel, channel mapping, PWM-input
-port, ...) are editable in an in-app settings panel and persist to `config.json`.
+A virtual RC transmitter for [Betaflight](https://betaflight.com/) in two modes:
+
+- **SITL** — UDP RC to Betaflight SITL (`:9004`) and PWM feedback (`:9001`)
+- **DEVICE** — Betaflight **MSP** over a WebSocket serial bridge (default
+  `ws://127.0.0.1:5761`): `MSP_SET_RAW_RC`, plus motor / servo / status polling
+
+Fly with **mouse** (drag sticks) or **keyboard** (WASD + arrows). All parameters
+persist to `config.json`.
 
 ![Two virtual gimbals with channel bars](docs/screenshot.png)
 
-## How it works
+## Modes
 
-Betaflight SITL listens for RC input on **UDP port 9004**. Each packet is a
-little-endian C struct:
+Switch **Mode** in Settings (`sitl` / `device`) or via `--mode`.
+
+### SITL (UDP)
+
+Betaflight SITL listens for RC on **UDP port 9004**:
 
 ```c
 typedef struct {
@@ -21,51 +26,42 @@ typedef struct {
 } rc_packet;
 ```
 
-This emulator packs `struct.pack('<d', time.time())` followed by 16 `uint16_t`
-channel values and sends it at the configured rate (default 50 Hz). Channels use
-the standard **AETR** mapping:
+PWM feedback uses `servo_packet_raw` on **UDP 9001** (see Motor panel). When
+**Require PWM link** is on, RC is only sent while PWM packets are arriving.
 
-| Channel | Function        | Source                 |
-|---------|-----------------|------------------------|
-| CH1     | Roll (Aileron)  | Right stick X          |
-| CH2     | Pitch (Elevator)| Right stick Y          |
-| CH3     | Throttle        | Left stick Y (sticky)  |
-| CH4     | Yaw (Rudder)    | Left stick X           |
-| CH5     | ARM             | `Enter` toggle         |
-| CH6-CH8 | AUX 1-3 (modes) | `1` / `2` / `3` toggles |
+### DEVICE (MSP over WebSocket)
 
-### Motor / PWM output (port 9001)
+Connects to an MSP-capable WebSocket bridge (raw binary MSP v1 frames, same
+byte stream Betaflight Configurator uses over serial). The client negotiates the
+WebSocket subprotocol **`binary`** (required by typical serial bridges such as
+the one on `ws://127.0.0.1:5761`).
 
-The SITL sends its raw PWM output (the `servo_packet_raw` struct) to UDP port 9001.
-The emulator binds that port and shows each motor/servo output as a live bar in the
-**Motor / PWM Output** panel, along with a receive status (`RECEIVING` / `WAITING`).
+| Direction | MSP command | ID |
+|-----------|-------------|----|
+| Out | `MSP_SET_RAW_RC` | 200 |
+| In (poll) | `MSP_MOTOR` | 104 |
+| In (poll) | `MSP_SERVO` | 103 |
+| In (poll) | `MSP_STATUS_EX` | 150 |
 
-```c
-typedef struct {
-    uint16_t motorCount;             // number of motors in the output
-    float    pwm_output_raw[16];     // raw PWM ~1000-2000 (motors first, then servos)
-} servo_packet_raw;                  // little-endian, 68 bytes (2 padding bytes after motorCount)
-```
+When **Require MSP link** is on, RC is only sent while the WebSocket is up and
+MSP replies arrive (~1.5 s timeout). The Status card shows FC armed from
+`MSP_STATUS_EX` when linked; CH5 still drives the override channel.
 
-Motors are drawn in blue (`M1..Mn`) and any active servo outputs in violet (`S1..`).
-Disable this listener or change its port under **Settings > Core** (`PWM in enabled`,
-`PWM in port`). The socket binds `0.0.0.0`, so it works whether the SITL targets
-`127.0.0.1` or this machine's LAN address.
+**Betaflight setup for DEVICE:**
 
-### Intelligent RC gating
+1. In Configurator **Ports**, enable **MSP** on the UART your bridge uses.
+2. **Receiver** = **MSP**, or use **MSP Override** with an AUX toggle.
+3. Run your serial↔WebSocket bridge so MSP bytes appear on
+   `ws://127.0.0.1:5761` (or set **MSP WebSocket URL**).
+4. Run the emulator with Mode = `device`.
 
-When **Require PWM link** is enabled (the default), the emulator only transmits RC
-while the SITL's PWM output is actually being received. If no PWM packet arrives for
-~1.5 s, RC sending pauses automatically and the header shows `STANDBY (no PWM)`;
-once packets resume, sending resumes (`SENDING`). This prevents the emulator from
-spraying stale RC at a SITL that isn't listening. Turn it off under
-**Settings > Core** (`Require PWM link`) to always transmit. The gate is ignored if
-`PWM in enabled` is off (there is nothing to gate on).
+Disconnect / stop sending → FC RX failsafe applies (your responsibility). `R`
+still zeros sticks and AUX locally.
 
 ## Requirements
 
 - Python 3.9+
-- [pygame](https://www.pygame.org/) (see `requirements.txt`)
+- [pygame](https://www.pygame.org/) and [websocket-client](https://github.com/websocket-client/websocket-client) (see `requirements.txt`)
 
 ## Install
 
@@ -73,7 +69,7 @@ spraying stale RC at a SITL that isn't listening. Turn it off under
 pip install -r requirements.txt
 ```
 
-On Windows you may need to use the Python launcher:
+On Windows you may need:
 
 ```bash
 py -m pip install -r requirements.txt
@@ -85,19 +81,20 @@ py -m pip install -r requirements.txt
 python joystick_emulator.py
 ```
 
-Optional command-line overrides (they take precedence over `config.json` for
-that run only):
+DEVICE mode against the default bridge:
 
 ```bash
-python joystick_emulator.py --ip 127.0.0.1 --port 9004 --hz 50
+python joystick_emulator.py --mode device --msp-url ws://127.0.0.1:5761
 ```
 
-| Flag       | Description                          | Default        |
-|------------|--------------------------------------|----------------|
-| `--ip`     | Target IP of the SITL RC input       | `127.0.0.1`    |
-| `--port`   | Target UDP port                      | `9004`         |
-| `--hz`     | Send rate in Hz                      | `50`           |
-| `--config` | Path to the settings file            | `./config.json`|
+| Flag        | Description                              | Default                 |
+|-------------|------------------------------------------|-------------------------|
+| `--mode`    | `sitl` or `device`                       | from config (`sitl`)    |
+| `--ip`      | SITL RC target IP                        | `127.0.0.1`             |
+| `--port`    | SITL RC UDP port                         | `9004`                  |
+| `--hz`      | RC send rate in Hz                       | `50`                    |
+| `--msp-url` | DEVICE MSP WebSocket URL                 | `ws://127.0.0.1:5761`   |
+| `--config`  | Path to the settings file                | `./config.json`         |
 
 ## Controls
 
@@ -116,28 +113,19 @@ you leave it (configurable via **Sticky throttle**).
 
 ### AUX channels (CH5–CH16)
 
-CH5–CH16 are fully configurable AUX channels. Each one has a **control type**
-you can change on the fly:
-
 | Type       | Badge | Behavior                                             |
 |------------|-------|------------------------------------------------------|
 | 2-position | `2P`  | Toggles between AUX low / AUX high                   |
 | 3-position | `3P`  | Cycles AUX low → mid (`PWM mid`) → AUX high          |
 | Slider     | `SL`  | Any value between AUX low and AUX high (drag it)     |
 
-Control them directly in the **Channels** panel:
-
 | Input                    | Action                                             |
 |--------------------------|----------------------------------------------------|
-| Left-click a channel     | Actuate: toggle (`2P`), cycle (`3P`), or set (`SL`)|
-| Drag a slider channel    | Set a continuous value (`SL` type only)            |
-| Right-click a channel    | Cycle its control type (`2P` → `3P` → `SL`), saved |
+| Left-click a channel     | Actuate / set                                      |
+| Drag a slider channel    | Continuous value (`SL`)                            |
+| Right-click a channel    | Cycle type (`2P` → `3P` → `SL`), saved             |
 | `Enter`                  | Actuate CH5 (ARM)                                  |
-| `1`…`9`, `0`             | Actuate CH6…CH15 (`1`→CH6 … `9`→CH14, `0`→CH15)    |
-
-CH5 conventionally arms the craft (its `2P` high = armed). The number of active
-AUX channels follows **Active channels** in the settings panel; channels beyond
-that count are held at `PWM mid`. Types are stored per-channel in `config.json`.
+| `1`…`9`, `0`             | Actuate CH6…CH15                                   |
 
 ### Commands
 
@@ -149,64 +137,46 @@ that count are held at `PWM mid`. Types are stored per-channel in `config.json`.
 
 ### Arming note
 
-Betaflight will refuse to arm unless the throttle is low. Keep throttle at the
-bottom, press `Enter` to arm (CH5 high), then raise throttle. Use `R` at any
-time as a panic/failsafe that disarms and cuts throttle.
+Keep throttle low, press `Enter` to raise CH5, then throttle up. Use `R` as
+panic/failsafe.
 
 ## Settings panel
-
-Press `Tab` to open the panel. It is grouped into Core, PWM range, Stick feel,
-Throttle and Channels.
 
 | Key                 | Action                                    |
 |---------------------|-------------------------------------------|
 | `Up` / `Down`       | Select a field                            |
 | `Left` / `Right`    | Adjust value (hold `Shift` for coarse step) |
-| `Enter`             | Type-edit a value (numbers / IP / order); `Enter` confirm, `Esc` cancel |
+| `Enter`             | Type-edit / cycle Mode; `Enter` confirm, `Esc` cancel |
 | `Ctrl`+`S`          | Save to `config.json`                     |
 | `D`                 | Reset all settings to defaults            |
 | `Tab` / `Esc`       | Close the panel                           |
 
-Changes apply live: editing **Target IP** / **Port** retargets the UDP socket,
-**Send rate** changes the loop rate, and PWM / feel / channel changes take
-effect on the next frame.
-
 ### Parameters
 
-- **Core**: `Target IP`, `RC out port` (default 9004), `Send rate (Hz)`,
-  `PWM in port` (default 9001), `PWM in enabled`, `Require PWM link` (gate RC on PWM)
-- **PWM range**: `PWM min` / `PWM mid` / `PWM max` (mid may be asymmetric)
-- **Stick feel**: `Return speed` (recenter rate), `Key step rate` (keyboard axis
-  speed), `Deadband`, `Expo`
-- **Throttle**: `Sticky throttle` (hold vs. auto-decay), `Arm-safe throttle PWM`
-  (value applied on reset)
-- **Channels**: `Channel order` (permutation of `AETR`), `Active channels`
-  (how many of CH1–CH16 are live), `AUX low PWM` / `AUX high PWM` (the low/high
-  endpoints shared by all AUX channels; per-channel types are set by right-click
-  in the Channels panel)
+- **Core (shared)**: `Mode` (`sitl` / `device`), `Send rate (Hz)`
+- **Core (SITL)**: `Target IP`, `RC out port`, `PWM in port`, `PWM in enabled`,
+  `Require PWM link`
+- **Core (DEVICE)**: `MSP WebSocket URL`, `MSP poll (Hz)`, `Require MSP link`
+- **PWM range / Stick feel / Throttle / Channels**: same as before (shared)
 
 ## Configuration file
 
-Settings are stored in `config.json` next to the script (created on first run).
-Every setting is written to the file, and on each launch the file is rewritten to
-include any newly added options (older configs are migrated automatically while
-preserving your existing values). Press `Ctrl`+`S` in the settings panel to save
-changes back to it. It is per-machine and git-ignored, so each environment keeps
-its own values. Delete it to return to defaults.
+Settings are stored in `config.json` next to the script. Every setting is
+written on load (migrating older files). Press `Ctrl`+`S` to save. The file is
+git-ignored.
 
 ## Using with Betaflight SITL
 
-1. Build and start the SITL: `./obj/main/betaflight_SITL.elf` (it prints
-   `start UDP server for RC input @9004`).
-2. Run this emulator (defaults target `127.0.0.1:9004`). If the SITL runs on
-   another host/VM (e.g. WSL), set **Target IP** accordingly.
-3. In the Betaflight Configurator, map CH5/CH6 to Arm / flight-mode switches so
-   the ARM and AUX toggles here do something useful.
-4. Arm and raise throttle: the **Motor / PWM Output** panel lights up `RECEIVING`
-   and the motor bars track the SITL's output. If it stays `WAITING`, confirm the
-   SITL was started so that it targets this machine (`betaflight_SITL.elf <ip>`)
-   and that nothing else is bound to port 9001.
+1. Start SITL (`start UDP server for RC input @9004`).
+2. Run with Mode = `sitl` (default), target `127.0.0.1:9004`.
+3. Map CH5/AUX in Configurator; arm and raise throttle — motor bars should show
+   `RECEIVING` from port 9001.
 
-The outgoing RC socket is fire-and-forget (non-blocking), and the incoming PWM
-listener is non-blocking too, so the emulator runs fine whether or not the SITL
-is currently running.
+## Using with a real FC (DEVICE)
+
+1. MSP enabled on the UART behind your WebSocket bridge.
+2. Receiver = MSP or MSP Override.
+3. Bridge listening on `ws://127.0.0.1:5761`.
+4. `python joystick_emulator.py --mode device`
+5. Header should leave `STANDBY (no MSP)` once replies arrive; sticks drive
+   `MSP_SET_RAW_RC`.
