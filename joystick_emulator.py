@@ -45,6 +45,7 @@ MSP_SERVO = 103
 MSP_MOTOR = 104
 MSP_STATUS_EX = 150
 MSP_SET_RAW_RC = 200
+MSP_SET_MOTOR = 214  # disarmed motor test / override
 
 WINDOW_W, WINDOW_H = 880, 648
 FPS_RENDER_CAP = 120  # Rendering may run faster than the RC send rate.
@@ -695,6 +696,7 @@ class MspDeviceLink:
         self._packets = 0
         self._rc_sent = 0
         self._pending_rc: Optional[bytes] = None
+        self._pending_motors: Optional[bytes] = None
 
         if enabled:
             self._start()
@@ -749,6 +751,19 @@ class MspDeviceLink:
         with self._lock:
             self._pending_rc = frame
 
+    def send_motors(self, values: list) -> None:
+        """Queue MSP_SET_MOTOR (disarmed motor override / test)."""
+        n = max(1, min(len(values), 8))
+        vals = [int(_clamp(v, 1000, 2000)) for v in values[:n]]
+        payload = struct.pack("<%dH" % n, *vals)
+        frame = MspCodec.encode_request(MSP_SET_MOTOR, payload)
+        with self._lock:
+            self._pending_motors = frame
+
+    def idle_motors(self, count: int = 4) -> None:
+        """Command all motors to min (1000)."""
+        self.send_motors([1000] * max(1, min(count, 8)))
+
     def snapshot(self) -> MspSnapshot:
         with self._lock:
             return MspSnapshot(
@@ -798,15 +813,24 @@ class MspDeviceLink:
             last_poll = 0.0
             try:
                 while not self._stop.is_set():
-                    # Flush pending RC
+                    # Flush pending RC / motor override frames.
                     with self._lock:
                         frame = self._pending_rc
                         self._pending_rc = None
+                        motor_frame = self._pending_motors
+                        self._pending_motors = None
                     if frame is not None:
                         try:
                             ws.send_binary(frame)
                             with self._lock:
                                 self._rc_sent += 1
+                        except Exception as exc:
+                            with self._lock:
+                                self._error = str(exc)
+                            break
+                    if motor_frame is not None:
+                        try:
+                            ws.send_binary(motor_frame)
                         except Exception as exc:
                             with self._lock:
                                 self._error = str(exc)
@@ -1146,11 +1170,16 @@ class App:
         self.panel_open = False
 
         self.running = True
-        self.dragging: Optional[str] = None  # "left" | "right" | ("aux", idx) | None
+        self.dragging: Optional[str] = None  # "left" | "right" | ("aux", idx) | ("motor", idx) | None
         self._send_accumulator = 0.0
         self.rc_active = False  # True while actually transmitting RC
         # Seconds each stick axis key has been held (for rate acceleration).
         self._key_hold = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "throttle": 0.0}
+        # DEVICE disarmed motor test (MSP_SET_MOTOR). Servos have no live MSP set.
+        self.motor_override = [1000] * 8
+        self.motor_test = False
+        self._motor_bar_layout: list = []
+        self._was_armed = False
 
         pygame.init()
         pygame.display.set_caption("Betaflight Joystick Emulator")
@@ -1199,6 +1228,8 @@ class App:
     def _on_settings_changed(self) -> None:
         self.sender.retarget(self.settings.ip, self.settings.port)
         sitl = not self.settings.is_device
+        if sitl and self.motor_test:
+            self._stop_motor_test(send_idle=True)
         self.pwm_in.reconfigure(
             self.settings.pwm_in_port,
             self.settings.pwm_in_enabled and sitl,
@@ -1221,10 +1252,41 @@ class App:
         self._shutdown()
 
     def _shutdown(self) -> None:
+        if self.settings.is_device:
+            self._stop_motor_test(send_idle=True)
+            time.sleep(0.05)  # give the WS thread a tick to flush idle motors
         self.sender.close()
         self.pwm_in.close()
         self.msp.close()
         pygame.quit()
+
+    def _fc_disarmed(self) -> bool:
+        """True when motor test is allowed (DEVICE + FC/local disarmed)."""
+        if not self.settings.is_device:
+            return False
+        msp = self.msp.snapshot()
+        if msp.alive(MspDeviceLink.RX_TIMEOUT):
+            return not msp.armed
+        return not self.state.armed
+
+    def _motor_count(self) -> int:
+        mc = self.msp.snapshot().motor_count
+        return max(1, min(mc if mc > 0 else 4, 8))
+
+    def _stop_motor_test(self, send_idle: bool = True) -> None:
+        self.motor_test = False
+        self.motor_override = [1000] * 8
+        if send_idle and self.settings.is_device:
+            self.msp.idle_motors(self._motor_count())
+
+    def _set_motor_override(self, idx: int, pwm: int) -> None:
+        if not self._fc_disarmed():
+            return
+        n = self._motor_count()
+        if not 0 <= idx < n:
+            return
+        self.motor_override[idx] = int(_clamp(pwm, 1000, 2000))
+        self.motor_test = True
 
     # ------------------------------------------------------------------
     # Events
@@ -1269,6 +1331,10 @@ class App:
             self._actuate_aux(0)  # CH5 (arm)
         elif key == pygame.K_r:
             self.state.reset(self.settings)
+            self._stop_motor_test(send_idle=True)
+        elif key == pygame.K_m and self.settings.is_device:
+            # Stop motor test / idle all motors
+            self._stop_motor_test(send_idle=True)
         elif key in self._NUM_KEY_AUX:
             self._actuate_aux(self._NUM_KEY_AUX[key])
 
@@ -1297,6 +1363,13 @@ class App:
                 self.dragging = "right"
                 self._drag_stick(pos)
                 return
+            # DEVICE + disarmed: drag a motor bar for MSP_SET_MOTOR test.
+            if self._fc_disarmed():
+                hit = self._motor_bar_hit(pos)
+                if hit is not None:
+                    self.dragging = ("motor", hit)
+                    self._drag_motor(hit, pos[1])
+                    return
 
         hit = self._channel_hit(pos)
         if hit is None:
@@ -1331,10 +1404,34 @@ class App:
                 self.state.set_pos(idx, frac, self.settings.aux_types)
                 return
 
+    def _motor_bar_hit(self, pos) -> Optional[int]:
+        for e in self._motor_bar_layout:
+            if e["rect"].collidepoint(pos):
+                return e["i"]
+        return None
+
+    def _drag_motor(self, idx: int, my: Optional[int] = None) -> None:
+        if my is None:
+            my = pygame.mouse.get_pos()[1]
+        for e in self._motor_bar_layout:
+            if e["i"] == idx:
+                # Top of bar = max (2000), bottom = min (1000)
+                frac = 1.0 - _clamp((my - e["top"]) / max(1, e["height"]), 0.0, 1.0)
+                pwm = int(round(1000 + frac * 1000))
+                self._set_motor_override(idx, pwm)
+                return
+
     # ------------------------------------------------------------------
     # Continuous input update
     # ------------------------------------------------------------------
     def _update_inputs(self, dt: float) -> None:
+        if isinstance(self.dragging, tuple) and self.dragging[0] == "motor":
+            if self._fc_disarmed():
+                self._drag_motor(self.dragging[1])
+            else:
+                self.dragging = None
+                self._stop_motor_test(send_idle=True)
+            return
         if isinstance(self.dragging, tuple) and self.dragging[0] == "aux":
             self._drag_aux(self.dragging[1])
             return
@@ -1415,13 +1512,25 @@ class App:
             if gate and not msp.alive(MspDeviceLink.RX_TIMEOUT):
                 self.rc_active = False
                 self._send_accumulator = 0.0
+                if self.motor_test:
+                    self._stop_motor_test(send_idle=False)
                 return
+
+            # Arming cancels motor test (mixer takes over).
+            armed_now = msp.armed if msp.alive(MspDeviceLink.RX_TIMEOUT) else self.state.armed
+            if armed_now and self.motor_test:
+                self._stop_motor_test(send_idle=True)
+            self._was_armed = armed_now
+
             self.rc_active = True
             interval = 1.0 / max(1, self.settings.send_hz)
             self._send_accumulator += dt
             sent = 0
             while self._send_accumulator >= interval and sent < 5:
                 self.msp.send_rc(channels)
+                if self.motor_test and not armed_now:
+                    n = self._motor_count()
+                    self.msp.send_motors(self.motor_override[:n])
                 self._send_accumulator -= interval
                 sent += 1
             return
@@ -1743,8 +1852,13 @@ class App:
             self._text(str(val), self.font_mono_sm, draw_col, (colx + col_w - 12, cy + 12), align="right")
 
     def _draw_motors_card(self, card: pygame.Rect) -> None:
-        title = "Motor / MSP Output" if self.settings.is_device else "Motor / PWM Output"
+        testable = self._fc_disarmed()
+        if self.settings.is_device:
+            title = "Motor Test (MSP)" if testable else "Motor / MSP Output"
+        else:
+            title = "Motor / PWM Output"
         self._panel(card, title)
+        self._motor_bar_layout = []
 
         if self.settings.is_device:
             msp = self.msp.snapshot()
@@ -1752,24 +1866,27 @@ class App:
                 status, scol = "DISABLED", COL_TEXT_FAINT
             elif msp.error and not msp.connected:
                 status, scol = "WS ERROR", COL_BAD
+            elif self.motor_test and testable:
+                status, scol = "MOTOR TEST", COL_WARN
             elif msp.alive(MspDeviceLink.RX_TIMEOUT):
                 status, scol = "RECEIVING", COL_GOOD
             else:
                 status, scol = "WAITING", COL_WARN
             header = f"MSP   {status}"
-            mc = msp.motor_count if msp.motor_count > 0 else 4
-            # Pack motors then any non-zero servos into the bar strip.
-            display = list(msp.motors[:mc])
-            extra = []
-            for v in msp.servos:
-                if len(display) + len(extra) >= 16:
-                    break
-                if v > 0:
-                    extra.append(v)
-            values_draw = display + extra
+            mc = self._motor_count()
+            if self.motor_test and testable:
+                values_draw = [float(v) for v in self.motor_override[:mc]]
+            else:
+                values_draw = list(msp.motors[:mc])
+            # Servos are display-only (BF has no live MSP servo set).
+            if not (self.motor_test and testable):
+                for v in msp.servos:
+                    if len(values_draw) >= 16:
+                        break
+                    if v > 0:
+                        values_draw.append(v)
             if not values_draw:
-                values_draw = [0.0] * max(4, mc)
-                mc = max(4, mc)
+                values_draw = [0.0] * mc
             total = max(1, min(len(values_draw), 16))
             motor_slots = min(mc, total)
         else:
@@ -1794,6 +1911,9 @@ class App:
 
         hx = self._text(header, self.font_h, scol, (card.right - 16, card.y + 13), align="right").x
         _fill_circle(self.screen, hx - 10, card.y + 18, 4, scol)
+        if self.settings.is_device and testable:
+            self._text("drag M bars  M=idle", self.font_small, COL_TEXT_FAINT,
+                       (card.x + 16, card.y + 13))
 
         area_top = card.y + 42
         area_bottom = card.bottom - 30
@@ -1801,6 +1921,7 @@ class App:
         slot = (card.w - 32) / total
         bar_w = int(min(46, slot - 14))
         base_x = card.x + 16
+        mouse = pygame.mouse.get_pos()
 
         for i in range(total):
             cx = base_x + slot * i + slot / 2
@@ -1808,10 +1929,24 @@ class App:
             v = values_draw[i] if i < len(values_draw) else 0.0
             frac = _clamp((v - 1000) / 1000.0, 0.0, 1.0)
             bx = int(cx - bar_w / 2)
-            pygame.draw.rect(self.screen, COL_TRACK, (bx, area_top, bar_w, bar_h), border_radius=4)
+            bar_rect = pygame.Rect(bx, area_top, bar_w, bar_h)
+            if is_motor and testable:
+                self._motor_bar_layout.append({
+                    "i": i, "rect": bar_rect, "top": area_top, "height": bar_h,
+                })
+                if bar_rect.collidepoint(mouse) or (
+                    isinstance(self.dragging, tuple)
+                    and self.dragging[0] == "motor"
+                    and self.dragging[1] == i
+                ):
+                    pygame.draw.rect(self.screen, COL_PANEL_LIGHT, bar_rect.inflate(4, 4), border_radius=5)
+
+            pygame.draw.rect(self.screen, COL_TRACK, bar_rect, border_radius=4)
             fh = int(bar_h * frac)
             if fh > 0:
-                fill_col = COL_ACCENT if is_motor else COL_AUX
+                fill_col = COL_WARN if (is_motor and self.motor_test and testable) else (
+                    COL_ACCENT if is_motor else COL_AUX
+                )
                 pygame.draw.rect(self.screen, fill_col, (bx, area_top + bar_h - fh, bar_w, fh), border_radius=4)
             midy = area_top + bar_h // 2
             pygame.draw.line(self.screen, COL_BORDER_HI, (bx, midy), (bx + bar_w, midy), 1)
@@ -1826,7 +1961,8 @@ class App:
         items = [
             ("W/S", "throttle"), ("A/D", "yaw"), ("Arrows", "pitch/roll"),
             ("Drag", "sticks"), ("Enter", "arm"), ("1-0", "aux"),
-            ("Click", "aux CH"), ("R", "reset"), ("Tab", "settings"), ("Esc", "quit"),
+            ("Click", "aux CH"), ("M", "motors idle"), ("R", "reset"),
+            ("Tab", "settings"), ("Esc", "quit"),
         ]
         y = WINDOW_H - 26
         x = 14

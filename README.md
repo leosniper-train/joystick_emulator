@@ -39,6 +39,7 @@ the one on `ws://127.0.0.1:5761`).
 | Direction | MSP command | ID |
 |-----------|-------------|----|
 | Out | `MSP_SET_RAW_RC` | 200 |
+| Out (disarmed) | `MSP_SET_MOTOR` | 214 |
 | In (poll) | `MSP_MOTOR` | 104 |
 | In (poll) | `MSP_SERVO` | 103 |
 | In (poll) | `MSP_STATUS_EX` | 150 |
@@ -46,6 +47,16 @@ the one on `ws://127.0.0.1:5761`).
 When **Require MSP link** is on, RC is only sent while the WebSocket is up and
 MSP replies arrive (~1.5 s timeout). The Status card shows FC armed from
 `MSP_STATUS_EX` when linked; CH5 still drives the override channel.
+
+### Motor test (disarmed only)
+
+While **DEVICE** mode is linked and the FC is **disarmed**, drag individual
+**M1…Mn** bars in the motor panel to spin motors via `MSP_SET_MOTOR` (same as
+Configurator motor test). Bars turn amber while testing. Press **`M`** (or
+**`R`**) to idle all motors to 1000. Arming automatically stops the test.
+
+**Servos** are display-only: Betaflight has no live MSP “set servo PWM”
+command (only configuration). Remove props before motor testing.
 
 **Betaflight setup for DEVICE:**
 
