@@ -1261,22 +1261,35 @@ class App:
         pygame.quit()
 
     def _fc_disarmed(self) -> bool:
-        """True when motor test is allowed (DEVICE + FC/local disarmed)."""
+        """True when motor test is allowed (DEVICE + both local and FC disarmed)."""
         if not self.settings.is_device:
             return False
+        if self.state.armed:
+            return False
         msp = self.msp.snapshot()
-        if msp.alive(MspDeviceLink.RX_TIMEOUT):
-            return not msp.armed
-        return not self.state.armed
+        if msp.alive(MspDeviceLink.RX_TIMEOUT) and msp.armed:
+            return False
+        return True
+
+    def _is_armed(self) -> bool:
+        """Armed if local CH5 is high or FC reports armed over MSP."""
+        if self.state.armed:
+            return True
+        msp = self.msp.snapshot()
+        return bool(msp.alive(MspDeviceLink.RX_TIMEOUT) and msp.armed)
 
     def _motor_count(self) -> int:
         mc = self.msp.snapshot().motor_count
         return max(1, min(mc if mc > 0 else 4, 8))
 
     def _stop_motor_test(self, send_idle: bool = True) -> None:
+        """Clear motor-test override and optionally command motors to idle (1000)."""
+        was_testing = self.motor_test or any(v > 1000 for v in self.motor_override)
         self.motor_test = False
         self.motor_override = [1000] * 8
-        if send_idle and self.settings.is_device:
+        if isinstance(self.dragging, tuple) and self.dragging[0] == "motor":
+            self.dragging = None
+        if send_idle and self.settings.is_device and was_testing:
             self.msp.idle_motors(self._motor_count())
 
     def _set_motor_override(self, idx: int, pwm: int) -> None:
@@ -1287,6 +1300,13 @@ class App:
             return
         self.motor_override[idx] = int(_clamp(pwm, 1000, 2000))
         self.motor_test = True
+
+    def _reset_motors_if_armed(self) -> None:
+        """If armed, force motor control back to idle / inactive."""
+        if self._is_armed() and (
+            self.motor_test or any(v > 1000 for v in self.motor_override)
+        ):
+            self._stop_motor_test(send_idle=True)
 
     # ------------------------------------------------------------------
     # Events
@@ -1329,6 +1349,7 @@ class App:
             self.panel_open = True
         elif key == pygame.K_RETURN:
             self._actuate_aux(0)  # CH5 (arm)
+            self._reset_motors_if_armed()
         elif key == pygame.K_r:
             self.state.reset(self.settings)
             self._stop_motor_test(send_idle=True)
@@ -1343,6 +1364,9 @@ class App:
         if 4 + idx >= self.settings.channel_count:
             return
         self.state.actuate(idx, self.settings.aux_types)
+        # Arming (CH5 high) must clear any MSP motor override immediately.
+        if idx == 0:
+            self._reset_motors_if_armed()
 
     def _cycle_aux_type(self, idx: int) -> None:
         """Cycle a channel's control type (2pos -> 3pos -> slider) and persist it."""
@@ -1516,10 +1540,12 @@ class App:
                     self._stop_motor_test(send_idle=False)
                 return
 
-            # Arming cancels motor test (mixer takes over).
-            armed_now = msp.armed if msp.alive(MspDeviceLink.RX_TIMEOUT) else self.state.armed
-            if armed_now and self.motor_test:
+            # Arming (local CH5 or FC) always resets motor override.
+            armed_now = self._is_armed()
+            if armed_now and not self._was_armed:
                 self._stop_motor_test(send_idle=True)
+            elif armed_now:
+                self._reset_motors_if_armed()
             self._was_armed = armed_now
 
             self.rc_active = True
@@ -1528,6 +1554,7 @@ class App:
             sent = 0
             while self._send_accumulator >= interval and sent < 5:
                 self.msp.send_rc(channels)
+                # Never send SET_MOTOR while armed; only while actively testing.
                 if self.motor_test and not armed_now:
                     n = self._motor_count()
                     self.msp.send_motors(self.motor_override[:n])
