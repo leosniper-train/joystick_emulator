@@ -41,13 +41,11 @@ the one on `ws://127.0.0.1:5761`).
 | Out | `MSP_SET_RAW_RC` | 200 |
 | In (poll) | `MSP_MOTOR` | 104 |
 | In (poll) | `MSP_SERVO` | 103 |
-| In (poll) | `MSP_ATTITUDE` | 108 |
 | In (poll) | `MSP_STATUS_EX` | 150 |
 
 When **Require MSP link** is on, RC is only sent while the WebSocket is up and
-MSP replies arrive (~1.5 s timeout). The Status card shows a small 3D quadrotor
-driven by `MSP_ATTITUDE` (roll / pitch / yaw), FC armed from `MSP_STATUS_EX`
-when linked, and CH5 still drives the override channel.
+MSP replies arrive (~1.5 s timeout). The Status card shows FC armed from
+`MSP_STATUS_EX` when linked; CH5 still drives the override channel.
 
 **Betaflight setup for DEVICE:**
 

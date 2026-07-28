@@ -43,7 +43,6 @@ MODES = ("sitl", "device")
 # MSP v1 command IDs (Betaflight)
 MSP_SERVO = 103
 MSP_MOTOR = 104
-MSP_ATTITUDE = 108
 MSP_STATUS_EX = 150
 MSP_SET_RAW_RC = 200
 
@@ -639,14 +638,12 @@ class MspSnapshot:
 
     __slots__ = (
         "enabled", "connected", "error", "motors", "servos", "motor_count",
-        "armed", "cycle_time", "cpu_load", "roll_deg", "pitch_deg", "yaw_deg",
-        "last_rx", "packets", "rc_sent",
+        "armed", "cycle_time", "cpu_load", "last_rx", "packets", "rc_sent",
     )
 
     def __init__(
         self, enabled, connected, error, motors, servos, motor_count,
-        armed, cycle_time, cpu_load, roll_deg, pitch_deg, yaw_deg,
-        last_rx, packets, rc_sent,
+        armed, cycle_time, cpu_load, last_rx, packets, rc_sent,
     ):
         self.enabled = enabled
         self.connected = connected
@@ -657,9 +654,6 @@ class MspSnapshot:
         self.armed = armed
         self.cycle_time = cycle_time
         self.cpu_load = cpu_load
-        self.roll_deg = roll_deg
-        self.pitch_deg = pitch_deg
-        self.yaw_deg = yaw_deg
         self.last_rx = last_rx
         self.packets = packets
         self.rc_sent = rc_sent
@@ -669,7 +663,7 @@ class MspSnapshot:
 
 
 class MspDeviceLink:
-    """WebSocket MSP client: SET_RAW_RC + MOTOR/SERVO/ATTITUDE/STATUS_EX polling."""
+    """WebSocket MSP client: SET_RAW_RC + MOTOR/SERVO/STATUS_EX polling."""
 
     RX_TIMEOUT = 1.5
     _RECONNECT_DELAY = 1.0
@@ -693,9 +687,6 @@ class MspDeviceLink:
         self._armed = False
         self._cycle_time = 0
         self._cpu_load = 0
-        self._roll_deg = 0.0
-        self._pitch_deg = 0.0
-        self._yaw_deg = 0.0
         self._last_rx = 0.0
         self._packets = 0
         self._rc_sent = 0
@@ -766,9 +757,6 @@ class MspDeviceLink:
                 self._armed,
                 self._cycle_time,
                 self._cpu_load,
-                self._roll_deg,
-                self._pitch_deg,
-                self._yaw_deg,
                 self._last_rx,
                 self._packets,
                 self._rc_sent,
@@ -824,7 +812,7 @@ class MspDeviceLink:
                     interval = 1.0 / self.poll_hz
                     if now - last_poll >= interval:
                         last_poll = now
-                        for cmd in (MSP_MOTOR, MSP_SERVO, MSP_ATTITUDE, MSP_STATUS_EX):
+                        for cmd in (MSP_MOTOR, MSP_SERVO, MSP_STATUS_EX):
                             try:
                                 ws.send_binary(MspCodec.encode_request(cmd))
                             except Exception as exc:
@@ -884,12 +872,6 @@ class MspDeviceLink:
                 for i, v in enumerate(vals[:16]):
                     servos[i] = float(v)
                 self._servos = servos
-            elif cmd == MSP_ATTITUDE and len(payload) >= 6:
-                # roll/pitch: decidegrees (0.1°), yaw: degrees
-                roll_raw, pitch_raw, yaw_raw = struct.unpack_from("<hhh", payload, 0)
-                self._roll_deg = roll_raw / 10.0
-                self._pitch_deg = pitch_raw / 10.0
-                self._yaw_deg = float(yaw_raw)
             elif cmd == MSP_STATUS_EX and len(payload) >= 11:
                 # cycleTime u16, i2cError u16, sensor u16, flightModeFlags u32, ...
                 cycle_time, _i2c, _sensor = struct.unpack_from("<HHH", payload, 0)
@@ -1588,41 +1570,34 @@ class App:
         inner_w = card.w - 28
 
         armed = self.state.armed
+        fc_note = "CH5"
         if self.settings.is_device:
             msp = self.msp.snapshot()
             if msp.alive(MspDeviceLink.RX_TIMEOUT):
                 armed = msp.armed
+                fc_note = "FC"
 
-        banner = pygame.Rect(inner_x, card.y + 42, inner_w, 36)
+        banner = pygame.Rect(inner_x, card.y + 44, inner_w, 50)
         if armed:
-            pygame.draw.rect(self.screen, COL_GOOD, banner, border_radius=8)
-            self._text("ARMED", self.font, (10, 20, 15), (banner.centerx, banner.y + 9), align="center")
+            pygame.draw.rect(self.screen, COL_GOOD, banner, border_radius=9)
+            self._text("ARMED", self.font_arm, (10, 20, 15), (banner.centerx, banner.y + 12), align="center")
         else:
-            pygame.draw.rect(self.screen, COL_PANEL_LIGHT, banner, border_radius=8)
-            pygame.draw.rect(self.screen, COL_BAD, banner, width=2, border_radius=8)
-            self._text("DISARMED", self.font, COL_BAD, (banner.centerx, banner.y + 9), align="center")
+            pygame.draw.rect(self.screen, COL_PANEL_LIGHT, banner, border_radius=9)
+            pygame.draw.rect(self.screen, COL_BAD, banner, width=2, border_radius=9)
+            self._text("DISARMED", self.font_arm, COL_BAD, (banner.centerx, banner.y + 12), align="center")
 
         if self.settings.is_device:
             msp = self.msp.snapshot()
-            # Attitude readout (left) + small 3D quad model (right).
-            hy = banner.bottom + 8
-            alive = msp.alive(MspDeviceLink.RX_TIMEOUT)
-            link = "MSP LINK" if alive else "MSP WAIT"
-            lcol = COL_GOOD if alive else COL_WARN
+            hy = banner.bottom + 10
+            link = "MSP LINK" if msp.alive(MspDeviceLink.RX_TIMEOUT) else "MSP WAIT"
+            lcol = COL_GOOD if msp.alive(MspDeviceLink.RX_TIMEOUT) else COL_WARN
             self._text(link, self.font_h, lcol, (inner_x + 2, hy))
-            self._text(f"R {msp.roll_deg:+.1f}°", self.font_mono_sm, COL_ACCENT, (inner_x + 2, hy + 16))
-            self._text(f"P {msp.pitch_deg:+.1f}°", self.font_mono_sm, COL_ACCENT, (inner_x + 2, hy + 30))
-            self._text(f"Y {msp.yaw_deg:+.0f}°", self.font_mono_sm, COL_TEXT_DIM, (inner_x + 2, hy + 44))
-            self._text(f"{msp.cpu_load}%  {msp.cycle_time}us", self.font_small,
-                       COL_TEXT_FAINT, (inner_x + 2, hy + 62))
-
-            model_cx = card.x + card.w - 70
-            model_cy = banner.bottom + 62
-            self._draw_quad_model(
-                model_cx, model_cy, 38,
-                msp.roll_deg, msp.pitch_deg, msp.yaw_deg,
-                armed=armed, active=alive,
-            )
+            self._text(f"load {msp.cpu_load}%  {msp.cycle_time}us", self.font_small,
+                       COL_TEXT_DIM, (inner_x + 2, hy + 16))
+            self._text(f"arm src: {fc_note}   CH5 still overrides", self.font_small,
+                       COL_TEXT_FAINT, (inner_x + 2, hy + 34))
+            self._text("Enter arm   Click AUX CH5-16", self.font_small,
+                       COL_TEXT_DIM, (inner_x + 2, hy + 52))
         else:
             hints = [
                 ("CH5-16", "AUX switches"),
@@ -1637,82 +1612,6 @@ class App:
                 hy += 18
             self._text("2P 2-pos   3P 3-pos   SL slider", self.font_small,
                        COL_TEXT_FAINT, (inner_x + 2, hy + 4))
-
-    def _draw_quad_model(
-        self, cx: int, cy: int, scale: float,
-        roll_deg: float, pitch_deg: float, yaw_deg: float,
-        armed: bool = False, active: bool = True,
-    ) -> None:
-        """Draw a small X-quadcopter projected from MSP attitude (degrees)."""
-        # Soft ground disk behind the model.
-        ground = pygame.Rect(cx - scale - 6, cy - scale - 4, (scale + 6) * 2, (scale + 4) * 2)
-        pygame.draw.ellipse(self.screen, COL_PANEL_LIGHT, ground)
-        pygame.draw.ellipse(self.screen, COL_BORDER, ground, width=1)
-
-        roll = math.radians(roll_deg)
-        pitch = math.radians(pitch_deg)
-        yaw = math.radians(yaw_deg)
-        cr, sr = math.cos(roll), math.sin(roll)
-        cp, sp = math.cos(pitch), math.sin(pitch)
-        cyaw, syaw = math.cos(yaw), math.sin(yaw)
-
-        def rot(x, y, z):
-            # Body → world: Rz(yaw) * Ry(pitch) * Rx(roll)
-            x1, y1, z1 = x, y * cr - z * sr, y * sr + z * cr
-            x2, y2, z2 = x1 * cp + z1 * sp, y1, -x1 * sp + z1 * cp
-            x3 = x2 * cyaw - y2 * syaw
-            y3 = x2 * syaw + y2 * cyaw
-            return x3, y3, z2
-
-        def proj(x, y, z):
-            # Slight top-down isometric camera.
-            px = cx + (x - y) * scale * 0.72
-            py = cy + (x + y) * scale * 0.42 - z * scale * 0.85
-            return int(px), int(py)
-
-        # X-quad motor hubs (front = +X in body frame).
-        hubs = [
-            (0.85, 0.85, 0.0, True),    # front-right
-            (0.85, -0.85, 0.0, True),   # front-left
-            (-0.85, -0.85, 0.0, False),  # rear-left
-            (-0.85, 0.85, 0.0, False),   # rear-right
-        ]
-        center = proj(*rot(0, 0, 0))
-        arm_col = COL_ACCENT if active else COL_MUTED
-        body_col = COL_GOOD if armed else COL_TEXT_DIM
-        prop_front = COL_ACCENT if active else COL_MUTED
-        prop_rear = COL_AUX if active else COL_MUTED
-
-        # Arms from center to each hub (painter's order by depth).
-        drawn = []
-        for hx, hy, hz, is_front in hubs:
-            wx, wy, wz = rot(hx, hy, hz)
-            drawn.append((wz, hx, hy, hz, is_front, wx, wy, wz))
-        drawn.sort(key=lambda t: t[0])  # far first
-
-        for _wz, hx, hy, hz, is_front, wx, wy, wz in drawn:
-            tip = proj(wx, wy, wz)
-            pygame.draw.line(self.screen, arm_col, center, tip, 2)
-            # Motor disk
-            r = max(4, int(scale * 0.28))
-            pcol = prop_front if is_front else prop_rear
-            _fill_circle(self.screen, tip[0], tip[1], r, pcol)
-            _fill_circle(self.screen, tip[0], tip[1], max(2, r // 3), COL_GIMBAL)
-            # Spin hint when armed
-            if armed and active:
-                pygame.draw.circle(self.screen, COL_BORDER_HI, tip, r + 2, 1)
-
-        # Body plate + nose marker (front).
-        body = [
-            proj(*rot(0.22, 0.18, 0.05)),
-            proj(*rot(0.22, -0.18, 0.05)),
-            proj(*rot(-0.22, -0.18, 0.05)),
-            proj(*rot(-0.22, 0.18, 0.05)),
-        ]
-        pygame.draw.polygon(self.screen, body_col, body)
-        nose = proj(*rot(0.35, 0.0, 0.08))
-        pygame.draw.line(self.screen, COL_THROTTLE, center, nose, 2)
-        _fill_circle(self.screen, nose[0], nose[1], 3, COL_THROTTLE)
 
     # ---- channels ----
     def _channel_layout(self):
