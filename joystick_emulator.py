@@ -118,7 +118,9 @@ class Settings:
 
     # Stick feel
     return_speed: float = 5.0  # normalized units/sec when recentering
-    key_step: float = 2.5      # normalized units/sec when a key is held
+    key_step: float = 2.5      # initial rate (normalized units/sec) when a key is pressed
+    key_accel: float = 6.0     # rate acceleration while held (units/sec^2); 0 = constant
+    key_step_max: float = 12.0 # max rate after acceleration (units/sec)
     deadband: float = 0.03     # ignore tiny stick offsets (0..0.4)
     expo: float = 0.0          # 0 = linear, 1 = full cubic softening
 
@@ -161,6 +163,8 @@ class Settings:
         self.pwm_mid = int(_clamp(self.pwm_mid, self.pwm_min, self.pwm_max))
         self.return_speed = float(_clamp(self.return_speed, 0.2, 50.0))
         self.key_step = float(_clamp(self.key_step, 0.2, 50.0))
+        self.key_accel = float(_clamp(self.key_accel, 0.0, 100.0))
+        self.key_step_max = float(_clamp(self.key_step_max, self.key_step, 100.0))
         self.deadband = float(_clamp(self.deadband, 0.0, 0.4))
         self.expo = float(_clamp(self.expo, 0.0, 1.0))
         self.throttle_arm_safe = int(_clamp(self.throttle_arm_safe, self.pwm_min, self.pwm_max))
@@ -943,6 +947,8 @@ def build_fields(mode: str = "sitl") -> list:
         Field("STICK FEEL", None, "header"),
         Field("Return speed", "return_speed", "float", 0.1, 1.0, 0.2, 50.0),
         Field("Key step rate", "key_step", "float", 0.1, 1.0, 0.2, 50.0),
+        Field("Key accel", "key_accel", "float", 0.5, 2.0, 0.0, 100.0),
+        Field("Key max rate", "key_step_max", "float", 0.5, 2.0, 0.2, 100.0),
         Field("Deadband", "deadband", "float", 0.01, 0.05, 0.0, 0.4),
         Field("Expo", "expo", "float", 0.05, 0.1, 0.0, 1.0),
         Field("THROTTLE", None, "header"),
@@ -1143,6 +1149,8 @@ class App:
         self.dragging: Optional[str] = None  # "left" | "right" | ("aux", idx) | None
         self._send_accumulator = 0.0
         self.rc_active = False  # True while actually transmitting RC
+        # Seconds each stick axis key has been held (for rate acceleration).
+        self._key_hold = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "throttle": 0.0}
 
         pygame.init()
         pygame.display.set_caption("Betaflight Joystick Emulator")
@@ -1340,33 +1348,46 @@ class App:
                 self._center_axis("yaw", dt)
                 if not self.settings.throttle_sticky:
                     self._decay_throttle(dt)
+            for k in self._key_hold:
+                self._key_hold[k] = 0.0
             return
 
         keys = pygame.key.get_pressed()
-        step = self.settings.key_step * dt
 
         # Right stick: arrows -> roll / pitch
         roll_in = (1 if keys[pygame.K_RIGHT] else 0) - (1 if keys[pygame.K_LEFT] else 0)
         pitch_in = (1 if keys[pygame.K_UP] else 0) - (1 if keys[pygame.K_DOWN] else 0)
-        self._drive_axis("roll", roll_in, step, dt)
-        self._drive_axis("pitch", pitch_in, step, dt)
+        self._drive_axis("roll", roll_in, dt)
+        self._drive_axis("pitch", pitch_in, dt)
 
         # Left stick: A/D -> yaw, W/S -> throttle (sticky)
         yaw_in = (1 if keys[pygame.K_d] else 0) - (1 if keys[pygame.K_a] else 0)
-        self._drive_axis("yaw", yaw_in, step, dt)
+        self._drive_axis("yaw", yaw_in, dt)
 
         thr_in = (1 if keys[pygame.K_w] else 0) - (1 if keys[pygame.K_s] else 0)
         if thr_in != 0:
+            step = self._key_rate("throttle", dt) * dt
             self.state.throttle = _clamp(self.state.throttle + thr_in * step, 0.0, 1.0)
-        elif not self.settings.throttle_sticky:
-            self._decay_throttle(dt)
+        else:
+            self._key_hold["throttle"] = 0.0
+            if not self.settings.throttle_sticky:
+                self._decay_throttle(dt)
 
-    def _drive_axis(self, attr: str, direction: int, step: float, dt: float) -> None:
-        cur = getattr(self, "state").__dict__[attr]
+    def _key_rate(self, attr: str, dt: float) -> float:
+        """Current keyboard stick rate for an axis, ramping up while held."""
+        hold = self._key_hold.get(attr, 0.0) + dt
+        self._key_hold[attr] = hold
+        rate = self.settings.key_step + self.settings.key_accel * hold
+        return min(rate, self.settings.key_step_max)
+
+    def _drive_axis(self, attr: str, direction: int, dt: float) -> None:
+        cur = getattr(self.state, attr)
         if direction != 0:
+            step = self._key_rate(attr, dt) * dt
             cur = _clamp(cur + direction * step, -1.0, 1.0)
             setattr(self.state, attr, cur)
         else:
+            self._key_hold[attr] = 0.0
             self._center_axis(attr, dt)
 
     def _center_axis(self, attr: str, dt: float) -> None:

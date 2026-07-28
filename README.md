@@ -157,7 +157,10 @@ panic/failsafe.
 - **Core (SITL)**: `Target IP`, `RC out port`, `PWM in port`, `PWM in enabled`,
   `Require PWM link`
 - **Core (DEVICE)**: `MSP WebSocket URL`, `MSP poll (Hz)`, `Require MSP link`
-- **PWM range / Stick feel / Throttle / Channels**: same as before (shared)
+- **PWM range / Stick feel / Throttle / Channels**: same as before (shared).
+  Stick feel includes **Key step rate** (initial hold speed), **Key accel**
+  (how fast rate ramps while a key is held; `0` = constant), and **Key max rate**
+  (ceiling after acceleration).
 
 ## Configuration file
 
